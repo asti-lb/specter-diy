@@ -30,6 +30,39 @@ def fix_mnemonic(phrase):
     return bip39.mnemonic_from_bytes(entropy)
 
 
+# number of dice rolls required per mnemonic length
+DICE_ROLLS_12WORD = 50
+DICE_ROLLS_24WORD = 99
+
+
+def mnemonic_from_dice(rolls) -> str:
+    """
+    Generates a mnemonic from a sequence of dice rolls.
+
+    `rolls` is a bytes-like object with one ASCII digit "1".."6" per roll.
+    The rolls are hashed as-is with a single SHA256, 50 rolls give a 12-word
+    mnemonic (first 16 bytes of the hash), 99 rolls give 24 words (full hash).
+
+    This matches how SeedSigner derives its entropy, so the same rolls produce
+    the same mnemonic on both devices. It is also what iancoleman.io/bip39
+    computes in "Base 10" or "Hex" mode - but not in its "Dice" mode, which
+    maps a 6 to 0.
+
+    The caller owns `rolls` and should overwrite it once the mnemonic is
+    derived - it is the seed.
+    """
+    if len(rolls) == DICE_ROLLS_12WORD:
+        num_bytes = 16
+    elif len(rolls) == DICE_ROLLS_24WORD:
+        num_bytes = 32
+    else:
+        raise RuntimeError("Invalid number of dice rolls")
+    for roll in rolls:
+        if roll < 0x31 or roll > 0x36:  # "1".."6"
+            raise RuntimeError("Invalid dice roll")
+    return bip39.mnemonic_from_bytes(hashlib.sha256(rolls).digest()[:num_bytes])
+
+
 def tagged_hash(tag: str, data: bytes) -> bytes:
     """BIP-Schnorr tag-specific key derivation"""
     hashtag = hashlib.sha256(tag.encode()).digest()
