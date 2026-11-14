@@ -64,6 +64,8 @@ static const char *init_stage = "not started";
  * do restante do estado, porque p4camera_deinit() o libera e vem antes das
  * funcoes de QR no arquivo. */
 static uint8_t *gray_buffer;
+/* Scratch plane for the grid-line filter, same size as gray_buffer. */
+static uint8_t *filter_buffer;
 static uint16_t gray_width;
 static uint16_t gray_height;
 static bool holding_frame;
@@ -278,6 +280,8 @@ void p4camera_deinit(void) {
     sensor = P4CAM_SENSOR_NONE;
     free(gray_buffer);
     gray_buffer = NULL;
+    free(filter_buffer);
+    filter_buffer = NULL;
     gray_width = gray_height = 0;
 }
 
@@ -402,12 +406,18 @@ void p4camera_gray_size(uint16_t *width, uint16_t *height) {
 static esp_err_t ensure_gray_buffer(void) {
     uint16_t width = frame_width / GRAY_DOWNSCALE;
     uint16_t height = frame_height / GRAY_DOWNSCALE;
-    if (gray_buffer && gray_width == width && gray_height == height) {
+    if (gray_buffer && filter_buffer && gray_width == width &&
+        gray_height == height) {
         return ESP_OK;
     }
     free(gray_buffer);
+    free(filter_buffer);
     gray_buffer = malloc((size_t)width * height);
-    if (!gray_buffer) {
+    filter_buffer = malloc((size_t)width * height);
+    if (!gray_buffer || !filter_buffer) {
+        free(gray_buffer);
+        free(filter_buffer);
+        gray_buffer = filter_buffer = NULL;
         gray_width = gray_height = 0;
         return ESP_ERR_NO_MEM;
     }
@@ -421,20 +431,74 @@ static esp_err_t ensure_gray_buffer(void) {
  * Usamos a aproximacao inteira (2R + 5G + B) / 8 em vez dos coeficientes ITU-R
  * exatos: e uma soma e um shift por pixel, e o quirc so precisa de contraste
  * entre modulo claro e escuro, nao de fidelidade colorimetrica. */
+static inline uint16_t rgb565_luma(uint16_t pixel) {
+    uint16_t r = (pixel >> 11) & 0x1f;
+    uint16_t g = (pixel >> 5) & 0x3f;
+    uint16_t b = pixel & 0x1f;
+    /* Escalados para 8 bits: r,b sao 5 bits e g e 6. */
+    return (uint16_t)(((r << 3) * 2 + (g << 2) * 5 + (b << 3)) / 8);
+}
+
+/* Each output pixel is the mean of a 2x2 block rather than a single sample:
+ * averaging halves the sensor noise, and skipping pixels aliases thin
+ * features such as the grid lines of a hand-filled SeedQR template into
+ * ragged dark specks. */
 static void rgb565_to_gray(const uint8_t *src) {
     const uint16_t *pixels = (const uint16_t *)src;
     for (uint16_t y = 0; y < gray_height; ++y) {
-        const uint16_t *row = pixels + (size_t)(y * GRAY_DOWNSCALE) * frame_width;
+        const uint16_t *row0 = pixels + (size_t)(y * GRAY_DOWNSCALE) * frame_width;
+        const uint16_t *row1 = row0 + frame_width;
         uint8_t *out = gray_buffer + (size_t)y * gray_width;
         for (uint16_t x = 0; x < gray_width; ++x) {
-            uint16_t pixel = row[x * GRAY_DOWNSCALE];
-            uint8_t r = (pixel >> 11) & 0x1f;
-            uint8_t g = (pixel >> 5) & 0x3f;
-            uint8_t b = pixel & 0x1f;
-            /* Escalados para 8 bits: r,b sao 5 bits e g e 6. */
-            out[x] = (uint8_t)(((r << 3) * 2 + (g << 2) * 5 + (b << 3)) / 8);
+            uint16_t x0 = x * GRAY_DOWNSCALE;
+            uint16_t sum = rgb565_luma(row0[x0]) + rgb565_luma(row0[x0 + 1]) +
+                           rgb565_luma(row1[x0]) + rgb565_luma(row1[x0 + 1]);
+            out[x] = (uint8_t)((sum + 2) >> 2);
         }
     }
+}
+
+/* One 3-tap max (dilate) or min pass along rows or along columns. */
+static void filter3(const uint8_t *src, uint8_t *dst, uint16_t w, uint16_t h,
+                    bool rows, bool dilate) {
+    for (uint16_t y = 0; y < h; ++y) {
+        for (uint16_t x = 0; x < w; ++x) {
+            size_t i = (size_t)y * w + x;
+            uint8_t v = src[i];
+            uint8_t a = rows ? (x > 0 ? src[i - 1] : v) : (y > 0 ? src[i - w] : v);
+            uint8_t b = rows ? (x + 1 < w ? src[i + 1] : v)
+                             : (y + 1 < h ? src[i + w] : v);
+            if (dilate) {
+                v = a > v ? a : v;
+                v = b > v ? b : v;
+            } else {
+                v = a < v ? a : v;
+                v = b < v ? b : v;
+            }
+            dst[i] = v;
+        }
+    }
+}
+
+/* Grey-level closing with a 3x3 square: dark features narrower than three
+ * pixels disappear, wider ones keep their size.
+ *
+ * SeedQR templates filled in by hand (SeedSigner) print a grid across the
+ * whole symbol, including the finder patterns. A grid line through the light
+ * ring of a finder joins its dark core to its dark frame, and quirc no longer
+ * sees the ring structure it looks for, so the symbol is never located. The
+ * closing erases the lines while the pen dots and printed finders survive. */
+static void close3(uint8_t *img, uint8_t *tmp, uint16_t w, uint16_t h) {
+    filter3(img, tmp, w, h, true, true);
+    filter3(tmp, img, w, h, false, true);
+    filter3(img, tmp, w, h, true, false);
+    filter3(tmp, img, w, h, false, false);
+}
+
+static int decode_gray(k_quirc_result_t *result) {
+    int found = k_quirc_decode_grayscale(gray_buffer, gray_width, gray_height,
+        result, 1, false);
+    return found > 0 && result->valid && result->data.payload_len > 0;
 }
 
 esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length) {
@@ -465,10 +529,13 @@ esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length) {
     p4camera_release();
 
     k_quirc_result_t result;
-    int found = k_quirc_decode_grayscale(gray_buffer, gray_width, gray_height,
-        &result, 1, false);
-    if (found <= 0 || !result.valid || result.data.payload_len <= 0) {
-        return ESP_ERR_NOT_FOUND;
+    /* Plain frame first; the grid-line filter only runs when that fails, so
+     * clean codes cost nothing extra. */
+    if (!decode_gray(&result)) {
+        close3(gray_buffer, filter_buffer, gray_width, gray_height);
+        if (!decode_gray(&result)) {
+            return ESP_ERR_NOT_FOUND;
+        }
     }
     size_t n = (size_t)result.data.payload_len;
     if (n > capacity) {
