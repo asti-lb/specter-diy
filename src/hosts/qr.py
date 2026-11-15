@@ -1068,7 +1068,6 @@ class QRHost(Host):
             return False
 
     def parse_prefix(self, prefix: bytes):
-        print(prefix)
         if not prefix.startswith(b"p") or b"of" not in prefix:
             raise HostError("Invalid prefix, should be in pMofN format")
         m, n = prefix[1:].split(b"of")
