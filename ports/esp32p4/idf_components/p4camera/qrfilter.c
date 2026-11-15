@@ -1,15 +1,10 @@
 /*
- * Grid-line removal and local threshold for the second QR scan attempt,
- * see qrfilter.h.
+ * Image filters for the second and third QR scan attempts, see qrfilter.h.
  */
 #include "qrfilter.h"
 
 #include <stdlib.h>
 #include <string.h>
-
-#if QRF_CLOSE != 5 || QRF_TILE != 16
-#error "the streaming filter is written for a 5-pixel window and 16-pixel tiles"
-#endif
 
 /* ------------------------------------------------------------------------
  * 16-byte vector operations.
@@ -83,55 +78,46 @@ static void *aligned_buf(size_t n) {
 #endif
 
 /* ------------------------------------------------------------------------
- * Streaming implementation
+ * Closing + tile threshold, streaming
  * ---------------------------------------------------------------------- */
 
-/* dst[x] = max (or min) of p[x-2 .. x+2]. p has 16 neutral bytes before
- * and after its w bytes. */
-static void hfilt_max(uint8_t *dst, const uint8_t *p, int w) {
+/* dst[x] = max (or min) of p[x-r .. x+r], r = 1 or 2. p has 16 neutral
+ * bytes before and after its w bytes. */
+static void hfilt(uint8_t *dst, const uint8_t *p, int w, int r, int dilate) {
     for (int x = 0; x < w; x += 16) {
         VLD(0, p + x - 16); VLD(1, p + x); VLD(2, p + x + 16);
-        VSAR(14); VSRC(3, 0, 1);
-        VSAR(15); VSRC(4, 0, 1);
-        VSAR(1);  VSRC(5, 1, 2);
-        VSAR(2);  VSRC(6, 1, 2);
-        VMAX(3, 3, 4); VMAX(5, 5, 6); VMAX(3, 3, 5); VMAX(3, 3, 1);
+        VSAR(15); VSRC(3, 0, 1);   /* p[x-1 ..] */
+        VSAR(1);  VSRC(4, 1, 2);   /* p[x+1 ..] */
+        if (r == 2) {
+            VSAR(14); VSRC(5, 0, 1);   /* p[x-2 ..] */
+            VSAR(2);  VSRC(6, 1, 2);   /* p[x+2 ..] */
+            if (dilate) { VMAX(3, 3, 5); VMAX(4, 4, 6); } else { VMIN(3, 3, 5); VMIN(4, 4, 6); }
+        }
+        if (dilate) { VMAX(3, 3, 4); VMAX(3, 3, 1); } else { VMIN(3, 3, 4); VMIN(3, 3, 1); }
         VST(3, dst + x);
     }
 }
 
-static void hfilt_min(uint8_t *dst, const uint8_t *p, int w) {
+/* dst = column-wise max (or min) of rows r[0 .. n-1], n = 3 or 5 */
+static void vfilt(uint8_t *dst, const uint8_t *const r[5], int n, int w, int dilate) {
     for (int x = 0; x < w; x += 16) {
-        VLD(0, p + x - 16); VLD(1, p + x); VLD(2, p + x + 16);
-        VSAR(14); VSRC(3, 0, 1);
-        VSAR(15); VSRC(4, 0, 1);
-        VSAR(1);  VSRC(5, 1, 2);
-        VSAR(2);  VSRC(6, 1, 2);
-        VMIN(3, 3, 4); VMIN(5, 5, 6); VMIN(3, 3, 5); VMIN(3, 3, 1);
-        VST(3, dst + x);
-    }
-}
-
-/* dst = column-wise max (or min) of five rows */
-static void vfilt_max(uint8_t *dst, const uint8_t *const r[5], int w) {
-    for (int x = 0; x < w; x += 16) {
-        VLD(0, r[0] + x); VLD(1, r[1] + x); VLD(2, r[2] + x); VLD(3, r[3] + x); VLD(4, r[4] + x);
-        VMAX(0, 0, 1); VMAX(2, 2, 3); VMAX(0, 0, 4); VMAX(0, 0, 2);
+        VLD(0, r[0] + x); VLD(1, r[1] + x); VLD(2, r[2] + x);
+        if (n == 5) {
+            VLD(3, r[3] + x); VLD(4, r[4] + x);
+            if (dilate) { VMAX(0, 0, 3); VMAX(1, 1, 4); } else { VMIN(0, 0, 3); VMIN(1, 1, 4); }
+        }
+        if (dilate) { VMAX(0, 0, 1); VMAX(0, 0, 2); } else { VMIN(0, 0, 1); VMIN(0, 0, 2); }
         VST(0, dst + x);
     }
 }
 
-static void vfilt_min(uint8_t *dst, const uint8_t *const r[5], int w) {
-    for (int x = 0; x < w; x += 16) {
-        VLD(0, r[0] + x); VLD(1, r[1] + x); VLD(2, r[2] + x); VLD(3, r[3] + x); VLD(4, r[4] + x);
-        VMIN(0, 0, 1); VMIN(2, 2, 3); VMIN(0, 0, 4); VMIN(0, 0, 2);
-        VST(0, dst + x);
-    }
+static size_t round16(size_t n) {
+    return (n + 15) & ~(size_t)15;
 }
 
-size_t qrf_work_size(int w, int h) {
-    size_t bw = (size_t)w / QRF_TILE, bh = ((size_t)h + QRF_TILE - 1) / QRF_TILE;
-    return 2 * ((size_t)w + 32) + 15 * (size_t)w + ((3 * bw * bh + 15) & ~(size_t)15);
+size_t qrf_close_work_size(int w, int h, int tile) {
+    size_t bw = ((size_t)w + tile - 1) / tile, bh = ((size_t)h + tile - 1) / tile;
+    return 2 * ((size_t)w + 32) + 16 * (size_t)w + round16(3 * bw * bh);
 }
 
 /* Midpoint of the darkest and lightest pixel in the 5x5 tile neighbourhood;
@@ -154,24 +140,26 @@ static void tile_thresholds(const uint8_t *mn, const uint8_t *mx, uint8_t *th, i
 }
 
 /*
- * One pass over the rows, t = 0 .. h+3:
- *   H(t)   = horizontal max of input row t            (ring A, 5 rows)
- *   E(t-2) = horizontal min of the vertical max of H(t-4 .. t)  (ring B)
- *   O(t-4) = vertical min of E(t-6 .. t-2)  -> written back to row t-4
- * Row t is read before row t-4 is overwritten, so the image can be filtered
- * in place. Outside the image the dilation sees 0 and the erosion 255, as
- * in the reference. Tile minima and maxima are gathered from O on the way.
+ * One pass over the rows, t = 0 .. h + 2r - 1 (r = radius):
+ *   H(t)    = horizontal max of input row t                 (ring A)
+ *   E(t-r)  = horizontal min of the vertical max of H(t-2r .. t)  (ring B)
+ *   O(t-2r) = vertical min of E(t-3r .. t-r) -> written back to row t-2r
+ * Row t is read before row t-2r is overwritten, so the image is filtered in
+ * place. Outside the image the dilation sees 0 and the erosion 255, as in
+ * the reference. Per-column minima and maxima of O are gathered on the way
+ * and folded into tile minima and maxima at the end of each tile row.
  */
-void qrf_close_binarize(uint8_t *img, int w, int h, uint8_t *work) {
-    const int bw = w / QRF_TILE, bh = (h + QRF_TILE - 1) / QRF_TILE;
+void qrf_close_tiles(uint8_t *img, int w, int h, int radius, int tile, uint8_t *work) {
+    if (w <= 0 || h <= 0 || w % 16 || radius < 1 || radius > 2 || tile <= 0 || w % tile) return;
+    const int r = radius, n = 2 * r + 1;
+    const int bw = w / tile, bh = (h + tile - 1) / tile;
     uint8_t *pad_a = work, *pad_b = pad_a + w + 32;
     uint8_t *ring_a = pad_b + w + 32, *ring_b = ring_a + 5 * w;
     uint8_t *zero = ring_b + 5 * w, *ones = zero + w, *out = ones + w;
-    uint8_t *acc_mn = out + w, *acc_mx = acc_mn + w;
-    uint8_t *mn = acc_mx + w, *mx = mn + bw * bh, *th = mx + bw * bh;
+    uint8_t *acc_mn = out + w, *acc_mx = acc_mn + w, *thr = acc_mx + w;
+    uint8_t *mn = thr + w, *mx = mn + bw * bh, *th = mx + bw * bh;
     const uint8_t *rows[5];
 
-    if (w <= 0 || h <= 0 || w % 16) return;
     memset(pad_a, 0, 16);
     memset(pad_a + 16 + w, 0, 16);
     memset(pad_b, 255, 16);
@@ -179,29 +167,29 @@ void qrf_close_binarize(uint8_t *img, int w, int h, uint8_t *work) {
     memset(zero, 0, w);
     memset(ones, 255, w);
 
-    for (int t = 0; t < h + 4; ++t) {
+    for (int t = 0; t < h + 2 * r; ++t) {
         if (t < h) {
             memcpy(pad_a + 16, img + (size_t)t * w, w);
-            hfilt_max(ring_a + (t % 5) * w, pad_a + 16, w);
+            hfilt(ring_a + (t % 5) * w, pad_a + 16, w, r, 1);
         }
-        int r = t - 2;
-        if (r >= 0 && r < h) {
-            for (int i = 0; i < 5; ++i) {
-                int s = r - 2 + i;
+        int e = t - r;
+        if (e >= 0 && e < h) {
+            for (int i = 0; i < n; ++i) {
+                int s = e - r + i;
                 rows[i] = (s < 0 || s >= h) ? zero : ring_a + (s % 5) * w;
             }
-            vfilt_max(pad_b + 16, rows, w);
-            hfilt_min(ring_b + (r % 5) * w, pad_b + 16, w);
+            vfilt(pad_b + 16, rows, n, w, 1);
+            hfilt(ring_b + (e % 5) * w, pad_b + 16, w, r, 0);
         }
-        int y = t - 4;
+        int y = t - 2 * r;
         if (y < 0) continue;
-        for (int i = 0; i < 5; ++i) {
-            int s = y - 2 + i;
+        for (int i = 0; i < n; ++i) {
+            int s = y - r + i;
             rows[i] = (s < 0 || s >= h) ? ones : ring_b + (s % 5) * w;
         }
-        vfilt_min(out, rows, w);
+        vfilt(out, rows, n, w, 0);
 
-        if (y % QRF_TILE == 0) {
+        if (y % tile == 0) {
             memset(acc_mn, 255, w);
             memset(acc_mx, 0, w);
         }
@@ -210,14 +198,13 @@ void qrf_close_binarize(uint8_t *img, int w, int h, uint8_t *work) {
             VLD(1, acc_mn + x); VMIN(1, 1, 0); VST(1, acc_mn + x);
             VLD(2, acc_mx + x); VMAX(2, 2, 0); VST(2, acc_mx + x);
         }
-        if (y % QRF_TILE == QRF_TILE - 1 || y == h - 1) {
-            int ty = y / QRF_TILE;
+        if (y % tile == tile - 1 || y == h - 1) {
+            int ty = y / tile;
             for (int bx = 0; bx < bw; ++bx) {
                 uint8_t lo = 255, hi = 0;
-                for (int i = 0; i < 16; ++i) {
-                    uint8_t a = acc_mn[bx * 16 + i], b = acc_mx[bx * 16 + i];
-                    lo = a < lo ? a : lo;
-                    hi = b > hi ? b : hi;
+                for (int i = bx * tile; i < (bx + 1) * tile; ++i) {
+                    lo = acc_mn[i] < lo ? acc_mn[i] : lo;
+                    hi = acc_mx[i] > hi ? acc_mx[i] : hi;
                 }
                 mn[ty * bw + bx] = lo;
                 mx[ty * bw + bx] = hi;
@@ -229,20 +216,81 @@ void qrf_close_binarize(uint8_t *img, int w, int h, uint8_t *work) {
     tile_thresholds(mn, mx, th, bw, bh);
 
     for (int y = 0; y < h; ++y) {
+        if (y % tile == 0) {
+            const uint8_t *bt = th + (y / tile) * bw;
+            for (int bx = 0; bx < bw; ++bx) memset(thr + bx * tile, bt[bx], tile);
+        }
         uint8_t *row = img + (size_t)y * w;
-        const uint8_t *bt = th + (y / QRF_TILE) * bw;
-        for (int bx = 0; bx < bw; ++bx) {
-            VBC(1, bt + bx);
-            VLD(0, row + bx * 16);
+        for (int x = 0; x < w; x += 16) {
+            VLD(0, row + x);
+            VLD(1, thr + x);
             VCMPLT(2, 0, 1);
             VNOT(2, 2);
-            VST(2, row + bx * 16);
+            VST(2, row + x);
         }
     }
 }
 
 /* ------------------------------------------------------------------------
- * Reference implementation (the code the firmware used before)
+ * Local mean threshold, streaming
+ * ---------------------------------------------------------------------- */
+
+size_t qrf_local_work_size(int w, int r) {
+    return round16((size_t)(2 * r + 2) * w) + round16(sizeof(uint32_t) * (size_t)w);
+}
+
+/*
+ * Column sums over the rows of the current window, updated by one row in and
+ * one row out per output row; then a running sum along the row. The output
+ * replaces row y while rows up to y + r are still needed as input, so every
+ * row is copied into a ring of 2r + 2 rows when it enters the window and
+ * taken from there when it leaves. The division by the window size is
+ * avoided: p * n * 100 < sum * (100 - t) is the reference's own test.
+ */
+void qrf_local_mean(uint8_t *img, int w, int h, int r, int t, uint8_t *work) {
+    if (w <= 0 || h <= 0 || r < 1) return;
+    const int ring_n = 2 * r + 2;
+    uint8_t *ring = work;
+    uint32_t *col = (uint32_t *)(work + round16((size_t)ring_n * w));
+    const uint32_t keep = (uint32_t)(100 - t);
+
+    memset(col, 0, sizeof(uint32_t) * (size_t)w);
+    /* rows 0 .. r-1 enter before the first output row */
+    for (int q = 0; q < r && q < h; ++q) {
+        uint8_t *dst = ring + (size_t)(q % ring_n) * w;
+        memcpy(dst, img + (size_t)q * w, w);
+        for (int x = 0; x < w; ++x) col[x] += dst[x];
+    }
+    for (int y = 0; y < h; ++y) {
+        int in = y + r, out = y - r - 1;
+        if (in < h) {
+            uint8_t *dst = ring + (size_t)(in % ring_n) * w;
+            memcpy(dst, img + (size_t)in * w, w);
+            for (int x = 0; x < w; ++x) col[x] += dst[x];
+        }
+        if (out >= 0) {
+            const uint8_t *src = ring + (size_t)(out % ring_n) * w;
+            for (int x = 0; x < w; ++x) col[x] -= src[x];
+        }
+        int y0 = y - r < 0 ? 0 : y - r, y1 = y + r + 1 > h ? h : y + r + 1;
+        uint32_t ny100 = (uint32_t)(y1 - y0) * 100;
+        const uint8_t *src = ring + (size_t)(y % ring_n) * w;
+        uint8_t *dst = img + (size_t)y * w;
+        uint32_t sum = 0;
+        for (int x = 0; x < r && x < w; ++x) sum += col[x];
+        for (int x = 0; x < w; ++x) {
+            if (x + r < w) sum += col[x + r];
+            if (x - r - 1 >= 0) sum -= col[x - r - 1];
+            int x0 = x - r < 0 ? 0 : x - r, x1 = x + r + 1 > w ? w : x + r + 1;
+            uint32_t n100 = (uint32_t)(x1 - x0) * ny100;
+            dst[x] = (uint32_t)src[x] * n100 < sum * keep ? 0 : 255;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * Reference implementations (the code of qr-lab/qrlab.c and of the
+ * previous firmware)
  * ---------------------------------------------------------------------- */
 
 static void op_span(uint8_t *dst, const uint8_t *a, const uint8_t *b, size_t n, int dilate) {
@@ -264,8 +312,8 @@ static void reduce(uint8_t *v, size_t n, size_t step, int k, int dilate) {
     }
 }
 
-static void filter_ref(uint8_t *img, int w, int h, uint8_t *pad, uint8_t *line, int dilate) {
-    const int k = QRF_CLOSE, r0 = (k - 1) / 2, padn = k - 1;
+static void filter_ref(uint8_t *img, int w, int h, int radius, uint8_t *pad, uint8_t *line, int dilate) {
+    const int k = 2 * radius + 1, r0 = radius, padn = k - 1;
     const uint8_t neutral = dilate ? 0 : 255;
     for (int y = 0; y < h; ++y) {
         memset(line, neutral, (size_t)w + padn);
@@ -279,21 +327,21 @@ static void filter_ref(uint8_t *img, int w, int h, uint8_t *pad, uint8_t *line, 
     memcpy(img, pad, (size_t)w * h);
 }
 
-void qrf_close_ref(uint8_t *img, int w, int h, uint8_t *pad, uint8_t *line) {
-    filter_ref(img, w, h, pad, line, 1);
-    filter_ref(img, w, h, pad, line, 0);
+void qrf_close_ref(uint8_t *img, int w, int h, int radius, uint8_t *pad, uint8_t *line) {
+    filter_ref(img, w, h, radius, pad, line, 1);
+    filter_ref(img, w, h, radius, pad, line, 0);
 }
 
-void qrf_binarize_ref(uint8_t *img, int w, int h, uint8_t *tiles) {
-    int bw = (w + QRF_TILE - 1) / QRF_TILE, bh = (h + QRF_TILE - 1) / QRF_TILE;
+void qrf_tiles_ref(uint8_t *img, int w, int h, int tile, uint8_t *tiles) {
+    int bw = (w + tile - 1) / tile, bh = (h + tile - 1) / tile;
     uint8_t *mn = tiles, *mx = mn + bw * bh, *th = mx + bw * bh;
     memset(mn, 255, (size_t)bw * bh);
     memset(mx, 0, (size_t)bw * bh);
     for (int y = 0; y < h; ++y) {
-        uint8_t *bmn = mn + (y / QRF_TILE) * bw, *bmx = mx + (y / QRF_TILE) * bw;
+        uint8_t *bmn = mn + (y / tile) * bw, *bmx = mx + (y / tile) * bw;
         const uint8_t *row = img + (size_t)y * w;
-        for (int bx = 0, x0 = 0; bx < bw; ++bx, x0 += QRF_TILE) {
-            int x1 = x0 + QRF_TILE < w ? x0 + QRF_TILE : w;
+        for (int bx = 0, x0 = 0; bx < bw; ++bx, x0 += tile) {
+            int x1 = x0 + tile < w ? x0 + tile : w;
             uint8_t lo = bmn[bx], hi = bmx[bx];
             for (int x = x0; x < x1; ++x) {
                 uint8_t p = row[x];
@@ -307,13 +355,39 @@ void qrf_binarize_ref(uint8_t *img, int w, int h, uint8_t *tiles) {
     tile_thresholds(mn, mx, th, bw, bh);
     for (int y = 0; y < h; ++y) {
         uint8_t *row = img + (size_t)y * w;
-        const uint8_t *bt = th + (y / QRF_TILE) * bw;
-        for (int bx = 0, x0 = 0; bx < bw; ++bx, x0 += QRF_TILE) {
-            int x1 = x0 + QRF_TILE < w ? x0 + QRF_TILE : w;
+        const uint8_t *bt = th + (y / tile) * bw;
+        for (int bx = 0, x0 = 0; bx < bw; ++bx, x0 += tile) {
+            int x1 = x0 + tile < w ? x0 + tile : w;
             uint8_t t = bt[bx];
             for (int x = x0; x < x1; ++x) row[x] = row[x] < t ? 0 : 255;
         }
     }
+}
+
+int qrf_local_mean_ref(uint8_t *img, int w, int h, int r, int t) {
+    uint32_t *ii = malloc(sizeof(uint32_t) * (size_t)(w + 1) * (h + 1));
+    if (!ii) return -1;
+    for (int x = 0; x <= w; x++) ii[x] = 0;
+    for (int y = 1; y <= h; y++) {
+        uint32_t row = 0;
+        ii[(size_t)y * (w + 1)] = 0;
+        for (int x = 1; x <= w; x++) {
+            row += img[(y - 1) * w + x - 1];
+            ii[(size_t)y * (w + 1) + x] = ii[(size_t)(y - 1) * (w + 1) + x] + row;
+        }
+    }
+    for (int y = 0; y < h; y++) {
+        int y0 = y - r < 0 ? 0 : y - r, y1 = y + r + 1 > h ? h : y + r + 1;
+        for (int x = 0; x < w; x++) {
+            int x0 = x - r < 0 ? 0 : x - r, x1 = x + r + 1 > w ? w : x + r + 1;
+            uint32_t sum = ii[(size_t)y1 * (w + 1) + x1] - ii[(size_t)y0 * (w + 1) + x1]
+                         - ii[(size_t)y1 * (w + 1) + x0] + ii[(size_t)y0 * (w + 1) + x0];
+            uint32_t n = (uint32_t)(x1 - x0) * (y1 - y0);
+            img[y * w + x] = (uint32_t)img[y * w + x] * n * 100 < sum * (uint32_t)(100 - t) ? 0 : 255;
+        }
+    }
+    free(ii);
+    return 0;
 }
 
 /* ------------------------------------------------------------------------
@@ -351,11 +425,13 @@ static int test_ops(uint8_t *buf) {
     return 0;
 }
 
-static int test_image(int w, int h, uint32_t seed) {
+/* kind 0: closing + tiles (radius, tile), kind 1: local mean (radius) */
+static int test_image(int kind, int w, int h, int radius, int tile, uint32_t seed) {
     size_t n = (size_t)w * h;
-    int bw = w / QRF_TILE, bh = (h + QRF_TILE - 1) / QRF_TILE;
-    uint8_t *a = aligned_buf(n), *b = aligned_buf(n), *work = aligned_buf(qrf_work_size(w, h));
-    uint8_t *pad = malloc((size_t)w * (h + QRF_CLOSE - 1)), *line = malloc((size_t)w + QRF_CLOSE);
+    size_t ws = kind ? qrf_local_work_size(w, radius) : qrf_close_work_size(w, h, tile);
+    int bw = (w + tile - 1) / tile, bh = (h + tile - 1) / tile;
+    uint8_t *a = aligned_buf(n), *b = aligned_buf(n), *work = aligned_buf(ws);
+    uint8_t *pad = malloc((size_t)w * (h + 2 * radius)), *line = malloc((size_t)w + 2 * radius);
     uint8_t *tiles = malloc(3 * (size_t)bw * bh);
     int bad = !a || !b || !work || !pad || !line || !tiles;
     if (!bad) {
@@ -369,10 +445,15 @@ static int test_image(int w, int h, uint32_t seed) {
             }
         }
         memcpy(b, a, n);
-        qrf_close_ref(a, w, h, pad, line);
-        qrf_binarize_ref(a, w, h, tiles);
-        qrf_close_binarize(b, w, h, work);
-        bad = memcmp(a, b, n) != 0;
+        if (kind) {
+            bad = qrf_local_mean_ref(a, w, h, radius, 15) != 0;
+            qrf_local_mean(b, w, h, radius, 15, work);
+        } else {
+            qrf_close_ref(a, w, h, radius, pad, line);
+            qrf_tiles_ref(a, w, h, tile, tiles);
+            qrf_close_tiles(b, w, h, radius, tile, work);
+        }
+        bad = bad || memcmp(a, b, n) != 0;
     }
     free(a); free(b); free(work); free(pad); free(line); free(tiles);
     return bad;
@@ -384,9 +465,18 @@ int qrf_selftest(void) {
     int r = test_ops(buf);
     free(buf);
     if (r) return r;
-    static const int sizes[][2] = {{16, 1}, {16, 3}, {32, 5}, {48, 37}, {64, 64}, {96, 50}};
-    for (int i = 0; i < (int)(sizeof(sizes) / sizeof(sizes[0])); ++i) {
-        if (test_image(sizes[i][0], sizes[i][1], 12345u + i)) return i + 1;
+    /* kind, w, h, radius, tile */
+    static const int cases[][5] = {
+        {0, 16, 1, 2, 16}, {0, 16, 3, 2, 16}, {0, 32, 5, 2, 16}, {0, 48, 37, 2, 16},
+        {0, 64, 64, 2, 16}, {0, 96, 50, 2, 16},
+        {0, 16, 1, 1, 8}, {0, 32, 7, 1, 8}, {0, 48, 37, 1, 8}, {0, 96, 50, 1, 8},
+        {0, 64, 40, 2, 8}, {0, 64, 40, 1, 16},
+        {1, 16, 1, 3, 16}, {1, 32, 9, 3, 16}, {1, 48, 37, 5, 16}, {1, 64, 64, 24, 16},
+        {1, 96, 70, 24, 16},
+    };
+    for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); ++i) {
+        const int *c = cases[i];
+        if (test_image(c[0], c[1], c[2], c[3], c[4], 12345u + i)) return i + 1;
     }
     return 0;
 }

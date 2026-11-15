@@ -69,10 +69,11 @@ static const char *init_stage = "not started";
  * do restante do estado, porque p4camera_deinit() o libera e vem antes das
  * funcoes de QR no arquivo. */
 static uint8_t *gray_buffer;
-/* Second attempt at full sensor resolution (see p4camera_scan): the
- * luminance plane and the work memory of qrf_close_binarize() (internal
- * RAM). The reference filter, used only if the PIE self-test fails, needs a
- * padded plane, a padded line and the per-tile minimum, maximum and threshold. */
+/* Full-resolution luminance plane for the third scan attempt, and the work
+ * memory of the qrfilter functions (internal RAM if it fits). The
+ * reference filter for the second attempt, used only if the PIE self-test
+ * fails, needs a padded plane, a padded line and the tile minima, maxima
+ * and thresholds. */
 static uint8_t *full_buffer;
 static uint8_t *work_buffer;
 static size_t work_size;
@@ -459,10 +460,15 @@ void p4camera_gray_size(uint16_t *width, uint16_t *height) {
     if (height) *height = gray_height;
 }
 
-/* Closing width (QRF_CLOSE = 5) and threshold tiles (QRF_TILE = 16 px) are
- * set in qrfilter.h. Measured on camera images of SeedSigner and T templates
- * at 10-25 cm: width 5 removes the printed grid lines (4 and 6 do worse),
- * 16 px tiles follow the light gradient across the card. */
+/* Second attempt, on the half-size plane: closing 3 x 3 (radius 1) and
+ * min/max tiles of 8 px. Third attempt, full resolution: mean threshold over
+ * 49 x 49 px (radius 24), dark when 15 % below the mean. Chosen on camera
+ * images of SeedSigner and T templates at 10-25 cm, by day and in the
+ * evening, and on simulated templates (journal 2.42). */
+#define HALF_CLOSE_RADIUS 1
+#define HALF_TILE         8
+#define FULL_MEAN_RADIUS  24
+#define FULL_MEAN_PERCENT 15
 
 static void free_scan_buffers(void) {
     if (gray_buffer) {
@@ -497,18 +503,22 @@ static esp_err_t ensure_gray_buffer(void) {
                      filter_selftest);
         }
     }
-    gray_buffer = malloc((size_t)width * height);
+    gray_buffer = heap_caps_aligned_alloc(16, (size_t)width * height, MALLOC_CAP_8BIT);
     full_buffer = heap_caps_aligned_alloc(16, fw * fh, MALLOC_CAP_8BIT);
-    work_size = qrf_work_size(fw, fh);
+    work_size = qrf_close_work_size(width, height, HALF_TILE);
+    if (qrf_local_work_size(fw, FULL_MEAN_RADIUS) > work_size) {
+        work_size = qrf_local_work_size(fw, FULL_MEAN_RADIUS);
+    }
     work_buffer = heap_caps_aligned_alloc(16, work_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!work_buffer) {
         work_buffer = heap_caps_aligned_alloc(16, work_size, MALLOC_CAP_8BIT);
     }
     bool ok = gray_buffer && full_buffer && work_buffer;
     if (ok && filter_selftest) {
-        size_t tiles = ((fw + QRF_TILE - 1) / QRF_TILE) * ((fh + QRF_TILE - 1) / QRF_TILE);
-        pad_buffer = malloc(fw * (fh + QRF_CLOSE - 1));
-        line_buffer = malloc(fw + QRF_CLOSE - 1);
+        size_t tiles = (((size_t)width + HALF_TILE - 1) / HALF_TILE) *
+                       (((size_t)height + HALF_TILE - 1) / HALF_TILE);
+        pad_buffer = malloc((size_t)width * (height + 2 * HALF_CLOSE_RADIUS));
+        line_buffer = malloc((size_t)width + 2 * HALF_CLOSE_RADIUS);
         tile_buffer = malloc(3 * tiles);
         ok = pad_buffer && line_buffer && tile_buffer;
     }
@@ -556,7 +566,7 @@ static void rgb565_to_gray(const uint8_t *src) {
     }
 }
 
-/* Grey-level closing over 5 x 5, then a local threshold, on full_buffer.
+/* Second attempt, in place on gray_buffer.
  *
  * Closing (max, then min): dark features narrower than the window disappear,
  * wider ones keep their size. SeedQR templates filled in by hand (SeedSigner)
@@ -565,17 +575,29 @@ static void rgb565_to_gray(const uint8_t *src) {
  * dark frame, and quirc no longer sees the ring structure it looks for. The
  * closing erases the lines while the pen dots and printed finders survive.
  *
- * Threshold: quirc's own comes from four image quadrants; a bright card on a
- * dark desk, or a keyboard in the frame, shifts it until the thin light rings
- * of the finders vanish. Here every 16 x 16 tile gets the midpoint of the
- * darkest and lightest pixel in its 5 x 5 tile neighbourhood. */
-static void close_binarize_full(void) {
+ * Tile threshold: quirc's own comes from four image quadrants; a bright card
+ * on a dark desk, or a keyboard in the frame, shifts it until the thin light
+ * rings of the finders vanish. Here every tile gets the midpoint of the
+ * darkest and lightest pixel in its 5 x 5 tile neighbourhood. On the
+ * half-size plane the 2x2 mean has already halved the sensor noise, which
+ * is what makes this work in dim light. */
+static void filter_half(void) {
     if (filter_selftest == 0) {
-        qrf_close_binarize(full_buffer, frame_width, frame_height, work_buffer);
+        qrf_close_tiles(gray_buffer, gray_width, gray_height, HALF_CLOSE_RADIUS, HALF_TILE,
+                        work_buffer);
     } else {
-        qrf_close_ref(full_buffer, frame_width, frame_height, pad_buffer, line_buffer);
-        qrf_binarize_ref(full_buffer, frame_width, frame_height, tile_buffer);
+        qrf_close_ref(gray_buffer, gray_width, gray_height, HALF_CLOSE_RADIUS, pad_buffer,
+                      line_buffer);
+        qrf_tiles_ref(gray_buffer, gray_width, gray_height, HALF_TILE, tile_buffer);
     }
+}
+
+/* Third attempt, in place on full_buffer: mean threshold at full resolution
+ * for codes too small or too far away for the half-size plane. Plain C, no
+ * PIE, so there is no reference fallback. */
+static void filter_full(void) {
+    qrf_local_mean(full_buffer, frame_width, frame_height, FULL_MEAN_RADIUS, FULL_MEAN_PERCENT,
+                   work_buffer);
 }
 
 static int decode_plane(const uint8_t *plane, uint16_t w, uint16_t h,
@@ -613,12 +635,16 @@ esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length) {
 
     k_quirc_result_t result;
     /* Cheap attempt first: the half-size plane as it is, which reads clean
-     * codes. Only when that fails, the full-resolution plane with the grid
-     * lines closed and a local threshold, for hand-filled templates and
-     * uneven light. */
+     * codes. Then the same plane with grid lines closed and a tile
+     * threshold, for hand-filled templates and dim light. Last, the
+     * full-resolution plane with a mean threshold. */
     int found = decode_plane(gray_buffer, gray_width, gray_height, &result);
     if (!found) {
-        close_binarize_full();
+        filter_half();
+        found = decode_plane(gray_buffer, gray_width, gray_height, &result);
+    }
+    if (!found) {
+        filter_full();
         found = decode_plane(full_buffer, frame_width, frame_height, &result);
     }
     if (!found) {
