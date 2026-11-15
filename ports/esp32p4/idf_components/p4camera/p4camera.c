@@ -38,6 +38,7 @@
 #include "esp_video_ioctl.h"
 #include "k_quirc.h"
 #include "linux/videodev2.h"
+#include "qrfilter.h"
 
 #define OV5647_SCCB_ADDR 0x36
 #define SC2336_SCCB_ADDR 0x30
@@ -68,13 +69,20 @@ static const char *init_stage = "not started";
  * do restante do estado, porque p4camera_deinit() o libera e vem antes das
  * funcoes de QR no arquivo. */
 static uint8_t *gray_buffer;
-/* Second attempt at full sensor resolution (see p4camera_scan): the
- * luminance plane, a padded plane and a padded line for the closing filter,
- * and the per-tile minimum, maximum and threshold of the local binarisation. */
+/* Full-resolution luminance plane for the third scan attempt, and the work
+ * memory of the qrfilter functions (internal RAM if it fits). The
+ * reference filter for the second attempt, used only if the PIE self-test
+ * fails, needs a padded plane, a padded line and the tile minima, maxima
+ * and thresholds. */
 static uint8_t *full_buffer;
+static uint8_t *work_buffer;
+static size_t work_size;
 static uint8_t *pad_buffer;
 static uint8_t *line_buffer;
 static uint8_t *tile_buffer;
+/* qrf_selftest() result: -1 not run yet, 0 PIE filter in use, otherwise
+ * the failing case and the reference filter in use. */
+static int filter_selftest = -1;
 static uint16_t gray_width;
 static uint16_t gray_height;
 static bool holding_frame;
@@ -445,22 +453,25 @@ void p4camera_gray_size(uint16_t *width, uint16_t *height) {
     if (height) *height = gray_height;
 }
 
-/* Closing width at full resolution and tile size of the local threshold.
- * Measured on camera images of SeedSigner and T templates at 10-25 cm:
- * width 5 removes the printed grid lines (4 and 6 do worse), 16 px tiles
- * follow the light gradient across the card. */
-#define FULL_CLOSE 5
-#define TILE 16
-/* Tiles whose 5x5 neighbourhood spans less contrast than this are paper. */
-#define TILE_MIN_CONTRAST 24
+/* Second attempt, on the half-size plane: closing 3 x 3 (radius 1) and
+ * min/max tiles of 8 px. Third attempt, full resolution: mean threshold over
+ * 49 x 49 px (radius 24), dark when 15 % below the mean. Chosen on camera
+ * images of SeedSigner and T templates at 10-25 cm, by day and in the
+ * evening, and on simulated templates (journal 2.42). */
+#define HALF_CLOSE_RADIUS 1
+#define HALF_TILE         8
+#define FULL_MEAN_RADIUS  24
+#define FULL_MEAN_PERCENT 15
 
 static void free_scan_buffers(void) {
     free(gray_buffer);
     free(full_buffer);
+    free(work_buffer);
     free(pad_buffer);
     free(line_buffer);
     free(tile_buffer);
-    gray_buffer = full_buffer = pad_buffer = line_buffer = tile_buffer = NULL;
+    gray_buffer = full_buffer = work_buffer = pad_buffer = line_buffer = tile_buffer = NULL;
+    work_size = 0;
     gray_width = gray_height = 0;
 }
 
@@ -472,13 +483,36 @@ static esp_err_t ensure_gray_buffer(void) {
     }
     free_scan_buffers();
     size_t fw = frame_width, fh = frame_height;
-    size_t tiles = ((fw + TILE - 1) / TILE) * ((fh + TILE - 1) / TILE);
-    gray_buffer = malloc((size_t)width * height);
-    full_buffer = malloc(fw * fh);
-    pad_buffer = malloc(fw * (fh + FULL_CLOSE - 1));
-    line_buffer = malloc(fw + FULL_CLOSE - 1);
-    tile_buffer = malloc(3 * tiles);
-    if (!gray_buffer || !full_buffer || !pad_buffer || !line_buffer || !tile_buffer) {
+    if (fw % 16) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (filter_selftest < 0) {
+        filter_selftest = qrf_selftest();
+        if (filter_selftest) {
+            ESP_LOGW(TAG, "PIE filter self-test failed (%d), using the reference filter",
+                     filter_selftest);
+        }
+    }
+    gray_buffer = heap_caps_aligned_alloc(16, (size_t)width * height, MALLOC_CAP_8BIT);
+    full_buffer = heap_caps_aligned_alloc(16, fw * fh, MALLOC_CAP_8BIT);
+    work_size = qrf_close_work_size(width, height, HALF_TILE);
+    if (qrf_local_work_size(fw, FULL_MEAN_RADIUS) > work_size) {
+        work_size = qrf_local_work_size(fw, FULL_MEAN_RADIUS);
+    }
+    work_buffer = heap_caps_aligned_alloc(16, work_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!work_buffer) {
+        work_buffer = heap_caps_aligned_alloc(16, work_size, MALLOC_CAP_8BIT);
+    }
+    bool ok = gray_buffer && full_buffer && work_buffer;
+    if (ok && filter_selftest) {
+        size_t tiles = (((size_t)width + HALF_TILE - 1) / HALF_TILE) *
+                       (((size_t)height + HALF_TILE - 1) / HALF_TILE);
+        pad_buffer = malloc((size_t)width * (height + 2 * HALF_CLOSE_RADIUS));
+        line_buffer = malloc((size_t)width + 2 * HALF_CLOSE_RADIUS);
+        tile_buffer = malloc(3 * tiles);
+        ok = pad_buffer && line_buffer && tile_buffer;
+    }
+    if (!ok) {
         free_scan_buffers();
         return ESP_ERR_NO_MEM;
     }
@@ -522,110 +556,38 @@ static void rgb565_to_gray(const uint8_t *src) {
     }
 }
 
-/* dst[i] = max (or min) of a[i] and b[i]. Kept as two plain loops so the
- * compiler can vectorise them. */
-static void op_span(uint8_t *dst, const uint8_t *a, const uint8_t *b, size_t n, bool dilate) {
-    if (dilate) {
-        for (size_t i = 0; i < n; ++i) dst[i] = a[i] > b[i] ? a[i] : b[i];
-    } else {
-        for (size_t i = 0; i < n; ++i) dst[i] = a[i] < b[i] ? a[i] : b[i];
-    }
-}
-
-/* Max (or min) over k consecutive elements spaced `step` apart, in place:
- * v[i] = op(v[i], v[i+step], ..., v[i+(k-1)*step]) for i < n - k + 1.
- * Doubling (pairs, then pairs of pairs, ...) plus one shifted pass for the
- * rest costs log2(k) + 1 operations per element whatever k is. */
-static void reduce(uint8_t *v, size_t n, size_t step, int k, bool dilate) {
-    int p = 1;
-    for (; p * 2 <= k; p *= 2) {
-        op_span(v, v, v + (size_t)p * step, (n - p) * step, dilate);
-    }
-    if (p < k) {
-        op_span(v, v, v + (size_t)(k - p) * step, (n - (k - p)) * step, dilate);
-    }
-}
-
-/* One k-wide max or min pass over rows, then over columns, centred on each
- * pixel; outside the image counts as neutral. */
-static void filter_full(bool dilate) {
-    const int k = FULL_CLOSE, r0 = (k - 1) / 2, pad = k - 1;
-    const uint8_t neutral = dilate ? 0 : 255;
-    size_t w = frame_width, h = frame_height;
-    for (size_t y = 0; y < h; ++y) {
-        memset(line_buffer, neutral, w + pad);
-        memcpy(line_buffer + r0, full_buffer + y * w, w);
-        reduce(line_buffer, w + pad, 1, k, dilate);
-        memcpy(full_buffer + y * w, line_buffer, w);
-    }
-    memset(pad_buffer, neutral, w * (h + pad));
-    memcpy(pad_buffer + (size_t)r0 * w, full_buffer, w * h);
-    reduce(pad_buffer, h + pad, w, k, dilate);
-    memcpy(full_buffer, pad_buffer, w * h);
-}
-
-/* Grey-level closing (max, then min) over FULL_CLOSE x FULL_CLOSE: dark
- * features narrower than the window disappear, wider ones keep their size.
+/* Second attempt, in place on gray_buffer.
  *
- * SeedQR templates filled in by hand (SeedSigner) print a grid across the
- * whole symbol, including the finder patterns. A grid line through the light
- * ring of a finder joins its dark core to its dark frame, and quirc no longer
- * sees the ring structure it looks for. The closing erases the lines while
- * the pen dots and printed finders survive. */
-static void close_full(void) {
-    filter_full(true);
-    filter_full(false);
+ * Closing (max, then min): dark features narrower than the window disappear,
+ * wider ones keep their size. SeedQR templates filled in by hand (SeedSigner)
+ * print a grid across the whole symbol, including the finder patterns. A
+ * grid line through the light ring of a finder joins its dark core to its
+ * dark frame, and quirc no longer sees the ring structure it looks for. The
+ * closing erases the lines while the pen dots and printed finders survive.
+ *
+ * Tile threshold: quirc's own comes from four image quadrants; a bright card
+ * on a dark desk, or a keyboard in the frame, shifts it until the thin light
+ * rings of the finders vanish. Here every tile gets the midpoint of the
+ * darkest and lightest pixel in its 5 x 5 tile neighbourhood. On the
+ * half-size plane the 2x2 mean has already halved the sensor noise, which
+ * is what makes this work in dim light. */
+static void filter_half(void) {
+    if (filter_selftest == 0) {
+        qrf_close_tiles(gray_buffer, gray_width, gray_height, HALF_CLOSE_RADIUS, HALF_TILE,
+                        work_buffer);
+    } else {
+        qrf_close_ref(gray_buffer, gray_width, gray_height, HALF_CLOSE_RADIUS, pad_buffer,
+                      line_buffer);
+        qrf_tiles_ref(gray_buffer, gray_width, gray_height, HALF_TILE, tile_buffer);
+    }
 }
 
-/* Local binarisation of full_buffer to 0/255. quirc's own threshold comes
- * from four image quadrants; a bright card on a dark desk, or a keyboard in
- * the frame, shifts it until the thin light rings of the finders vanish.
- * Here every TILE x TILE tile gets the midpoint of the darkest and lightest
- * pixel in its 5x5 tile neighbourhood; flat neighbourhoods count as paper. */
-static void binarize_full(void) {
-    size_t w = frame_width, h = frame_height;
-    size_t bw = (w + TILE - 1) / TILE, bh = (h + TILE - 1) / TILE;
-    uint8_t *mn = tile_buffer, *mx = mn + bw * bh, *th = mx + bw * bh;
-    memset(mn, 255, bw * bh);
-    memset(mx, 0, bw * bh);
-    for (size_t y = 0; y < h; ++y) {
-        uint8_t *bmn = mn + (y / TILE) * bw, *bmx = mx + (y / TILE) * bw;
-        const uint8_t *row = full_buffer + y * w;
-        for (size_t bx = 0, x0 = 0; bx < bw; ++bx, x0 += TILE) {
-            size_t x1 = x0 + TILE < w ? x0 + TILE : w;
-            uint8_t lo = bmn[bx], hi = bmx[bx];
-            for (size_t x = x0; x < x1; ++x) {
-                uint8_t p = row[x];
-                lo = p < lo ? p : lo;
-                hi = p > hi ? p : hi;
-            }
-            bmn[bx] = lo;
-            bmx[bx] = hi;
-        }
-    }
-    for (size_t by = 0; by < bh; ++by) {
-        for (size_t bx = 0; bx < bw; ++bx) {
-            int lo = 255, hi = 0;
-            for (int dy = -2; dy <= 2; ++dy) {
-                for (int dx = -2; dx <= 2; ++dx) {
-                    int yy = (int)by + dy, xx = (int)bx + dx;
-                    if (yy < 0 || yy >= (int)bh || xx < 0 || xx >= (int)bw) continue;
-                    if (mn[yy * bw + xx] < lo) lo = mn[yy * bw + xx];
-                    if (mx[yy * bw + xx] > hi) hi = mx[yy * bw + xx];
-                }
-            }
-            th[by * bw + bx] = hi - lo < TILE_MIN_CONTRAST ? lo : (uint8_t)((lo + hi + 1) / 2);
-        }
-    }
-    for (size_t y = 0; y < h; ++y) {
-        uint8_t *row = full_buffer + y * w;
-        const uint8_t *bt = th + (y / TILE) * bw;
-        for (size_t bx = 0, x0 = 0; bx < bw; ++bx, x0 += TILE) {
-            size_t x1 = x0 + TILE < w ? x0 + TILE : w;
-            uint8_t t = bt[bx];
-            for (size_t x = x0; x < x1; ++x) row[x] = row[x] < t ? 0 : 255;
-        }
-    }
+/* Third attempt, in place on full_buffer: mean threshold at full resolution
+ * for codes too small or too far away for the half-size plane. Plain C, no
+ * PIE, so there is no reference fallback. */
+static void filter_full(void) {
+    qrf_local_mean(full_buffer, frame_width, frame_height, FULL_MEAN_RADIUS, FULL_MEAN_PERCENT,
+                   work_buffer);
 }
 
 static int decode_plane(const uint8_t *plane, uint16_t w, uint16_t h,
@@ -663,15 +625,20 @@ esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length) {
 
     k_quirc_result_t result;
     /* Cheap attempt first: the half-size plane as it is, which reads clean
-     * codes. Only when that fails, the full-resolution plane with the grid
-     * lines closed and a local threshold, for hand-filled templates and
-     * uneven light. */
-    if (!decode_plane(gray_buffer, gray_width, gray_height, &result)) {
-        close_full();
-        binarize_full();
-        if (!decode_plane(full_buffer, frame_width, frame_height, &result)) {
-            return ESP_ERR_NOT_FOUND;
-        }
+     * codes. Then the same plane with grid lines closed and a tile
+     * threshold, for hand-filled templates and dim light. Last, the
+     * full-resolution plane with a mean threshold. */
+    int found = decode_plane(gray_buffer, gray_width, gray_height, &result);
+    if (!found) {
+        filter_half();
+        found = decode_plane(gray_buffer, gray_width, gray_height, &result);
+    }
+    if (!found) {
+        filter_full();
+        found = decode_plane(full_buffer, frame_width, frame_height, &result);
+    }
+    if (!found) {
+        return ESP_ERR_NOT_FOUND;
     }
     size_t n = (size_t)result.data.payload_len;
     if (n > capacity) {
