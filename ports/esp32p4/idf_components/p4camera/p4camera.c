@@ -701,6 +701,9 @@ void p4camera_flush(void) {
     if (gray_buffer) {
         memset(gray_buffer, 0, (size_t)gray_width * gray_height);
     }
+    if (full_buffer) {
+        memset(full_buffer, 0, (size_t)frame_width * frame_height);
+    }
     if (preview_buffer) {
         memset(preview_buffer, 0, preview_capacity * sizeof(uint16_t));
     }
