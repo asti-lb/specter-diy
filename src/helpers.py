@@ -215,3 +215,16 @@ else:
     _conv_time = utime.gmtime if hasattr(utime, "gmtime") else utime.localtime
     def conv_time(t):
         return _conv_time(t - _UNIX_EPOCH_OFFSET)
+
+
+def format_btc(sat):
+    """Formats an amount in satoshi as BTC with 8 decimals.
+
+    Uses integer arithmetic only: with single-precision floats
+    (MicroPython on some ports) "%.8f" % (sat / 1e8) keeps about
+    7 significant digits, so 68.99999716 BTC was shown as 69.00000000.
+    """
+    sat = int(sat)
+    sign = "-" if sat < 0 else ""
+    sat = abs(sat)
+    return "%s%d.%08d" % (sign, sat // 100000000, sat % 100000000)
