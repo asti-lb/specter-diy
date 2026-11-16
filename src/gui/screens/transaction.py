@@ -28,7 +28,9 @@ class TransactionScreen(Prompt):
         if enable_inputs:
             self.details_sw.add_state(lv.STATE.CHECKED)
 
-        # change page a bit
+        # change page a bit; LVGL 9 computes positions lazily, so refresh
+        # the layout before reading where the label ended up
+        lbl.update_layout()
         self.page.set_pos(0, lbl.get_y()+20)
         self.page.set_size(480, 800-130-lbl.get_y())
 
@@ -39,6 +41,9 @@ class TransactionScreen(Prompt):
         self.page2.add_flag(lv.obj.FLAG.SCROLLABLE)
         self.page2.set_scroll_dir(lv.DIR.VER)
         self.page2.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
+        # page2 is created after the switch and overlaps its lower edge;
+        # keep the switch on top so it still gets the touch
+        self.details_sw.move_foreground()
 
         # define styles
         style = lv.style_t()
