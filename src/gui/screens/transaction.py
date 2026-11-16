@@ -146,14 +146,14 @@ class TransactionScreen(Prompt):
                     seq_text = "Non-standard"
                 seqlbl.set_text("Seq: 0x%08X (%s)" % (sequence, seq_text))
                 seqlbl.add_style(style_gray, 0)
-                seqlbl.align(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
+                seqlbl.align_to(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
                 seqlbl.set_x(60)
                 lbl = seqlbl
                 if is_relative_locktime:
                     rltlbl = lv.label(self.page2)
                     rltlbl.add_style(style_gray, 0)
                     rltlbl.set_text(self.relative_locktime_to_text(sequence))
-                    rltlbl.align(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
+                    rltlbl.align_to(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
                     lbl = rltlbl
             if inp.get("sighash", ""):
                 shlbl = lv.label(self.page2)
@@ -220,7 +220,7 @@ class TransactionScreen(Prompt):
         verlbl.add_style(style_gray, 0)
         verlbl.set_text("Transaction Version: %d" % meta["tx_version"])
         # If the fee label is present, we want to be close to it. Otherwise, we want a larger margin.
-        verlbl.align(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5 if fee else 30)
+        verlbl.align_to(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5 if fee else 30)
         verlbl.set_x(30)
         locktime = meta["locktime"]
         if all(inp["sequence"] == 0xFFFFFFFF for inp in meta["inputs"]):
@@ -228,28 +228,28 @@ class TransactionScreen(Prompt):
             ltlbl = lv.label(self.page2)
             ltlbl.add_style(style_gray, 0)
             ltlbl.set_text("Locktime: %d" % locktime)
-            ltlbl.align(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
+            ltlbl.align_to(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
             ltdiabledlbl = lv.label(self.page2)
             ltdiabledlbl.add_style(style_warning, 0)
             ltdiabledlbl.set_text("All inputs have locktime disabled!" if meta["inputs"] else "No inputs!")
-            ltdiabledlbl.align(ltlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
+            ltdiabledlbl.align_to(ltlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
         elif locktime <= 499999999:
             # Block height. See: https://learnmeabitcoin.com/technical/transaction/locktime
             ltlbl = lv.label(self.page2)
             ltlbl.add_style(style_gray, 0)
             ltlbl.set_text("Locktime: %d (Block Height)" % locktime)
-            ltlbl.align(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
+            ltlbl.align_to(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
         else:
             # Block timestamp. See: https://learnmeabitcoin.com/technical/transaction/locktime
             ltlbl = lv.label(self.page2)
             ltlbl.add_style(style_gray, 0)
             ltlbl.set_text("Locktime: %d (Timestamp)" % locktime)
-            ltlbl.align(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
+            ltlbl.align_to(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
             mp_time = conv_time(locktime)
             ltdatelbl = lv.label(self.page2)
             ltdatelbl.add_style(style_gray, 0)
             ltdatelbl.set_text("%04d-%02d-%02d %02d:%02d:%02d UTC" % mp_time[:6])
-            ltdatelbl.align(ltlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
+            ltdatelbl.align_to(ltlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
 
         self.toggle_details()
 
