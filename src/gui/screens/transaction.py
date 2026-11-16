@@ -1,6 +1,6 @@
 import lvgl as lv
 import platform
-from helpers import conv_time
+from helpers import conv_time, format_btc
 from .prompt import Prompt
 from ..common import add_label, format_addr, styles
 from ..decorators import on_release
@@ -136,7 +136,7 @@ class TransactionScreen(Prompt):
             lbl = lv.label(self.page2)
             lbl.set_long_mode(lv.label.LONG_MODE.WRAP)
             lbl.set_width(380)
-            valuetxt = "???" if inp["value"] == -1 else "%.8f" % (inp["value"]/1e8)
+            valuetxt = "???" if inp["value"] == -1 else format_btc(inp["value"])
             lbl.set_text("%s %s from %s" % (valuetxt, inp.get("asset", self.default_asset), inp.get("label", "Unknown wallet")))
             lbl.add_style(style_primary, 0)
             lbl.align_to(idxlbl, lv.ALIGN.TOP_LEFT, 0, 0)
@@ -195,7 +195,7 @@ class TransactionScreen(Prompt):
             lbl = lv.label(self.page2)
             lbl.set_long_mode(lv.label.LONG_MODE.WRAP)
             lbl.set_width(380)
-            valuetxt = "???" if out["value"] == -1 else "%.8f" % (out["value"]/1e8)
+            valuetxt = "???" if out["value"] == -1 else format_btc(out["value"])
             lbl.set_text("%s %s to %s" % (valuetxt, out.get("asset", self.default_asset), out.get("label", "")))
             lbl.add_style(style_primary, 0)
             lbl.align_to(idxlbl, lv.ALIGN.TOP_LEFT, 0, 0)
@@ -284,7 +284,7 @@ class TransactionScreen(Prompt):
 
     def show_output(self, out, obj):
         # show output
-        valuetxt = "???" if out["value"] == -1 else "%.8f" % (out["value"]/1e8)
+        valuetxt = "???" if out["value"] == -1 else format_btc(out["value"])
         lbl = add_label(
             "%s %s to" % (valuetxt, out.get("asset", self.default_asset)), style="title", scr=self.page
         )

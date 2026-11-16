@@ -14,7 +14,7 @@ from .wallet import WalletError, Wallet
 from .commands import DELETE, EDIT
 from io import BytesIO
 from bcur import bcur_decode_stream
-from helpers import a2b_base64_stream, b2a_base64_stream
+from helpers import a2b_base64_stream, b2a_base64_stream, format_btc
 import gc
 import json
 
@@ -377,7 +377,7 @@ class WalletManager(BaseApp):
             else:
                 name = w.name
             amount = wallets[w].get("amount", 0)
-            spends.append('%.8f %s\nfrom "%s"' % (amount / 1e8, unit, name))
+            spends.append('%s %s\nfrom "%s"' % (format_btc(amount), unit, name))
         title = "Inputs:\n" + "\n".join(spends)
         return await show_screen(TransactionScreen(title, meta))
 
