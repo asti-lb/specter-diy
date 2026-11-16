@@ -31,12 +31,18 @@ class TransactionScreen(Prompt):
         # change page a bit; LVGL 9 computes positions lazily, so refresh
         # the layout before reading where the label ended up
         lbl.update_layout()
-        self.page.set_pos(0, lbl.get_y()+20)
-        self.page.set_size(480, 800-130-lbl.get_y())
+        self.details_sw.update_layout()
+        # start the pages below the switch, which is taller than the label
+        page_y = max(lbl.get_y() + lbl.get_height(),
+                     self.details_sw.get_y() + self.details_sw.get_height()) + 10
+        self.page.set_pos(0, page_y)
+        self.page.set_size(480, 800-130-page_y)
 
         self.page2 = lv.obj(self)
-        self.page2.set_pos(self.page.get_x(), self.page.get_y())
-        self.page2.set_size(self.page.get_width(), self.page.get_height())
+        # set_pos()/set_size() above are not applied until the next layout
+        # pass, so reuse the values instead of reading them back
+        self.page2.set_pos(0, page_y)
+        self.page2.set_size(480, 800-130-page_y)
         self.page2.add_style(styles["page"], 0)
         self.page2.add_flag(lv.obj.FLAG.SCROLLABLE)
         self.page2.set_scroll_dir(lv.DIR.VER)
@@ -44,6 +50,9 @@ class TransactionScreen(Prompt):
         # page2 is created after the switch and overlaps its lower edge;
         # keep the switch on top so it still gets the touch
         self.details_sw.move_foreground()
+        # the switch is small for a finger; accept touches around it too
+        if hasattr(self.details_sw, "set_ext_click_area"):
+            self.details_sw.set_ext_click_area(20)
 
         # define styles
         style = lv.style_t()
@@ -175,6 +184,7 @@ class TransactionScreen(Prompt):
         lbl = add_label("%d %s" % (meta_outputs_len, "OUTPUT" if meta_outputs_len == 1 else "OUTPUTS"), scr=self.page2)
         lbl.add_style(style, 0)
         lbl.align(lv.ALIGN.TOP_MID, 0, 0)
+        obj.update_layout()
         lbl.set_y(obj.get_y() + obj.get_height() + 30)
         for i, out in enumerate(meta["outputs"]):
             idxlbl = lv.label(self.page2)
