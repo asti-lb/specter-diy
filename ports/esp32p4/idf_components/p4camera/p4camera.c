@@ -75,11 +75,15 @@ static uint8_t *gray_buffer;
  * fails, needs a padded plane, a padded line and the tile minima, maxima
  * and thresholds. */
 static uint8_t *full_buffer;
+static size_t full_size;
 static uint8_t *work_buffer;
 static size_t work_size;
 static uint8_t *pad_buffer;
+static size_t pad_size;
 static uint8_t *line_buffer;
+static size_t line_size;
 static uint8_t *tile_buffer;
+static size_t tile_size;
 /* qrf_selftest() result: -1 not run yet, 0 PIE filter in use, otherwise
  * the failing case and the reference filter in use. */
 static int filter_selftest = -1;
@@ -275,6 +279,7 @@ fail:
     return ESP_FAIL;
 }
 
+static void blank_scan_buffers(void);
 static void free_scan_buffers(void);
 
 void p4camera_deinit(void) {
@@ -412,14 +417,12 @@ esp_err_t p4camera_preview_enable(uint16_t width, uint16_t height, uint16_t **bu
 void p4camera_preview_disable(void) {
     preview_width = preview_height = 0;
     /* The scan screen is closing. The preview buffer outlives it, and the
-     * greyscale buffer still holds the last frame handed to the decoder:
-     * both may show a seed, so blank them now instead of at the next scan. */
+     * scan buffers still hold the last frame handed to the decoder: both may
+     * show a seed, so blank them now instead of at the next scan. */
     if (preview_buffer) {
         memset(preview_buffer, 0, preview_capacity * sizeof(uint16_t));
     }
-    if (gray_buffer) {
-        memset(gray_buffer, 0, (size_t)gray_width * gray_height);
-    }
+    blank_scan_buffers();
 }
 
 uint32_t p4camera_preview_frames(void) {
@@ -470,10 +473,32 @@ void p4camera_gray_size(uint16_t *width, uint16_t *height) {
 #define FULL_MEAN_RADIUS  24
 #define FULL_MEAN_PERCENT 15
 
-static void free_scan_buffers(void) {
+/* Every scan buffer may hold a picture of a seed, or a filtered copy of it.
+ * Blank them all in one place, so a buffer added later cannot be missed by
+ * one of the callers: flush, closing the scan screen, and freeing. */
+static void blank_scan_buffers(void) {
     if (gray_buffer) {
         memset(gray_buffer, 0, (size_t)gray_width * gray_height);
     }
+    if (full_buffer) {
+        memset(full_buffer, 0, full_size);
+    }
+    if (work_buffer) {
+        memset(work_buffer, 0, work_size);
+    }
+    if (pad_buffer) {
+        memset(pad_buffer, 0, pad_size);
+    }
+    if (line_buffer) {
+        memset(line_buffer, 0, line_size);
+    }
+    if (tile_buffer) {
+        memset(tile_buffer, 0, tile_size);
+    }
+}
+
+static void free_scan_buffers(void) {
+    blank_scan_buffers();
     free(gray_buffer);
     free(full_buffer);
     free(work_buffer);
@@ -481,7 +506,7 @@ static void free_scan_buffers(void) {
     free(line_buffer);
     free(tile_buffer);
     gray_buffer = full_buffer = work_buffer = pad_buffer = line_buffer = tile_buffer = NULL;
-    work_size = 0;
+    full_size = work_size = pad_size = line_size = tile_size = 0;
     gray_width = gray_height = 0;
 }
 
@@ -504,7 +529,8 @@ static esp_err_t ensure_gray_buffer(void) {
         }
     }
     gray_buffer = heap_caps_aligned_alloc(16, (size_t)width * height, MALLOC_CAP_8BIT);
-    full_buffer = heap_caps_aligned_alloc(16, fw * fh, MALLOC_CAP_8BIT);
+    full_size = fw * fh;
+    full_buffer = heap_caps_aligned_alloc(16, full_size, MALLOC_CAP_8BIT);
     work_size = qrf_close_work_size(width, height, HALF_TILE);
     if (qrf_local_work_size(fw, FULL_MEAN_RADIUS) > work_size) {
         work_size = qrf_local_work_size(fw, FULL_MEAN_RADIUS);
@@ -517,9 +543,12 @@ static esp_err_t ensure_gray_buffer(void) {
     if (ok && filter_selftest) {
         size_t tiles = (((size_t)width + HALF_TILE - 1) / HALF_TILE) *
                        (((size_t)height + HALF_TILE - 1) / HALF_TILE);
-        pad_buffer = malloc((size_t)width * (height + 2 * HALF_CLOSE_RADIUS));
-        line_buffer = malloc((size_t)width + 2 * HALF_CLOSE_RADIUS);
-        tile_buffer = malloc(3 * tiles);
+        pad_size = (size_t)width * (height + 2 * HALF_CLOSE_RADIUS);
+        line_size = (size_t)width + 2 * HALF_CLOSE_RADIUS;
+        tile_size = 3 * tiles;
+        pad_buffer = malloc(pad_size);
+        line_buffer = malloc(line_size);
+        tile_buffer = malloc(tile_size);
         ok = pad_buffer && line_buffer && tile_buffer;
     }
     if (!ok) {
@@ -675,9 +704,7 @@ void p4camera_flush(void) {
         drop_queued_frames();
         last_capture_us = esp_timer_get_time();
     }
-    if (gray_buffer) {
-        memset(gray_buffer, 0, (size_t)gray_width * gray_height);
-    }
+    blank_scan_buffers();
     if (preview_buffer) {
         memset(preview_buffer, 0, preview_capacity * sizeof(uint16_t));
     }
