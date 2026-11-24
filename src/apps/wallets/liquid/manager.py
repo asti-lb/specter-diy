@@ -8,7 +8,7 @@ from embit.liquid.transaction import LSIGHASH as SIGHASH
 from embit.liquid.addresses import address as liquid_address
 from embit.liquid.addresses import to_unconfidential
 from .wallet import WalletError, LWallet
-from helpers import is_liquid
+from helpers import is_liquid, format_btc
 import secp256k1
 from platform import get_preallocated_ram
 
@@ -228,7 +228,7 @@ class LWalletManager(WalletManager):
             else:
                 name = w.name
             amount = wallets[w]["amount"]
-            spend = ", ".join("%s %s" % ("???" if val < 0 else "%.8f" % (val/1e8), self.asset_label(asset)) for asset, val in amount.items())
+            spend = ", ".join("%s %s" % ("???" if val < 0 else format_btc(val), self.asset_label(asset)) for asset, val in amount.items())
             spends.append('%s\nfrom "%s"' % (spend, name))
         title = "Inputs:\n" + "\n".join(spends)
         if meta.get("issuance", False):
