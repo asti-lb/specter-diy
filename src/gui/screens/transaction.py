@@ -28,17 +28,31 @@ class TransactionScreen(Prompt):
         if enable_inputs:
             self.details_sw.add_state(lv.STATE.CHECKED)
 
-        # change page a bit
-        self.page.set_pos(0, lbl.get_y()+20)
-        self.page.set_size(480, 800-130-lbl.get_y())
+        # change page a bit; LVGL 9 computes positions lazily, so refresh
+        # the layout before reading where the label ended up
+        lbl.update_layout()
+        self.details_sw.update_layout()
+        # start the pages below the switch, which is taller than the label
+        page_y = max(lbl.get_y() + lbl.get_height(),
+                     self.details_sw.get_y() + self.details_sw.get_height()) + 10
+        self.page.set_pos(0, page_y)
+        self.page.set_size(480, 800-130-page_y)
 
         self.page2 = lv.obj(self)
-        self.page2.set_pos(self.page.get_x(), self.page.get_y())
-        self.page2.set_size(self.page.get_width(), self.page.get_height())
+        # set_pos()/set_size() above are not applied until the next layout
+        # pass, so reuse the values instead of reading them back
+        self.page2.set_pos(0, page_y)
+        self.page2.set_size(480, 800-130-page_y)
         self.page2.add_style(styles["page"], 0)
         self.page2.add_flag(lv.obj.FLAG.SCROLLABLE)
         self.page2.set_scroll_dir(lv.DIR.VER)
         self.page2.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
+        # page2 is created after the switch and overlaps its lower edge;
+        # keep the switch on top so it still gets the touch
+        self.details_sw.move_foreground()
+        # the switch is small for a finger; accept touches around it too
+        if hasattr(self.details_sw, "set_ext_click_area"):
+            self.details_sw.set_ext_click_area(20)
 
         # define styles
         style = lv.style_t()
@@ -146,14 +160,14 @@ class TransactionScreen(Prompt):
                     seq_text = "Non-standard"
                 seqlbl.set_text("Seq: 0x%08X (%s)" % (sequence, seq_text))
                 seqlbl.add_style(style_gray, 0)
-                seqlbl.align(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
+                seqlbl.align_to(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
                 seqlbl.set_x(60)
                 lbl = seqlbl
                 if is_relative_locktime:
                     rltlbl = lv.label(self.page2)
                     rltlbl.add_style(style_gray, 0)
                     rltlbl.set_text(self.relative_locktime_to_text(sequence))
-                    rltlbl.align(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
+                    rltlbl.align_to(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
                     lbl = rltlbl
             if inp.get("sighash", ""):
                 shlbl = lv.label(self.page2)
@@ -170,6 +184,7 @@ class TransactionScreen(Prompt):
         lbl = add_label("%d %s" % (meta_outputs_len, "OUTPUT" if meta_outputs_len == 1 else "OUTPUTS"), scr=self.page2)
         lbl.add_style(style, 0)
         lbl.align(lv.ALIGN.TOP_MID, 0, 0)
+        obj.update_layout()
         lbl.set_y(obj.get_y() + obj.get_height() + 30)
         for i, out in enumerate(meta["outputs"]):
             idxlbl = lv.label(self.page2)
@@ -220,7 +235,7 @@ class TransactionScreen(Prompt):
         verlbl.add_style(style_gray, 0)
         verlbl.set_text("Transaction Version: %d" % meta["tx_version"])
         # If the fee label is present, we want to be close to it. Otherwise, we want a larger margin.
-        verlbl.align(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5 if fee else 30)
+        verlbl.align_to(lbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5 if fee else 30)
         verlbl.set_x(30)
         locktime = meta["locktime"]
         if all(inp["sequence"] == 0xFFFFFFFF for inp in meta["inputs"]):
@@ -228,28 +243,28 @@ class TransactionScreen(Prompt):
             ltlbl = lv.label(self.page2)
             ltlbl.add_style(style_gray, 0)
             ltlbl.set_text("Locktime: %d" % locktime)
-            ltlbl.align(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
+            ltlbl.align_to(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
             ltdiabledlbl = lv.label(self.page2)
             ltdiabledlbl.add_style(style_warning, 0)
             ltdiabledlbl.set_text("All inputs have locktime disabled!" if meta["inputs"] else "No inputs!")
-            ltdiabledlbl.align(ltlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
+            ltdiabledlbl.align_to(ltlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
         elif locktime <= 499999999:
             # Block height. See: https://learnmeabitcoin.com/technical/transaction/locktime
             ltlbl = lv.label(self.page2)
             ltlbl.add_style(style_gray, 0)
             ltlbl.set_text("Locktime: %d (Block Height)" % locktime)
-            ltlbl.align(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
+            ltlbl.align_to(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
         else:
             # Block timestamp. See: https://learnmeabitcoin.com/technical/transaction/locktime
             ltlbl = lv.label(self.page2)
             ltlbl.add_style(style_gray, 0)
             ltlbl.set_text("Locktime: %d (Timestamp)" % locktime)
-            ltlbl.align(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
+            ltlbl.align_to(verlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 0, 5)
             mp_time = conv_time(locktime)
             ltdatelbl = lv.label(self.page2)
             ltdatelbl.add_style(style_gray, 0)
             ltdatelbl.set_text("%04d-%02d-%02d %02d:%02d:%02d UTC" % mp_time[:6])
-            ltdatelbl.align(ltlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
+            ltdatelbl.align_to(ltlbl, lv.ALIGN.OUT_BOTTOM_LEFT, 15, 5)
 
         self.toggle_details()
 
