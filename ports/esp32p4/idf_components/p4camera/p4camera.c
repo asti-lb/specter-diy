@@ -644,10 +644,32 @@ static void filter_full(void) {
                    work_buffer);
 }
 
+/* Decodes the first readable code in plane. *seen is set when quirc located
+ * a code - three finder patterns forming a grid - even if it could not read
+ * it, which is what a code too fine for the plane looks like. */
 static int decode_plane(const uint8_t *plane, uint16_t w, uint16_t h,
-                        k_quirc_result_t *result) {
-    int found = k_quirc_decode_grayscale(plane, w, h, result, 1, false);
-    return found > 0 && result->valid && result->data.payload_len > 0;
+                        k_quirc_result_t *result, bool *seen) {
+    *seen = false;
+    k_quirc_t *q = k_quirc_new();
+    if (!q) {
+        return 0;
+    }
+    int found = 0;
+    if (k_quirc_resize(q, w, h) == 0) {
+        uint8_t *buf = k_quirc_begin(q, NULL, NULL);
+        if (buf) {
+            memcpy(buf, plane, (size_t)w * h);
+            k_quirc_end(q, false);
+            int count = k_quirc_count(q);
+            *seen = count > 0;
+            for (int i = 0; i < count && !found; ++i) {
+                found = k_quirc_decode(q, i, result) == K_QUIRC_SUCCESS &&
+                        result->valid && result->data.payload_len > 0;
+            }
+        }
+    }
+    k_quirc_destroy(q);
+    return found;
 }
 
 esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length) {
@@ -684,17 +706,21 @@ esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length) {
      *
      * The frame is held until it is clear whether the third attempt runs,
      * because only then is the full-resolution plane built from it. */
-    int found = decode_plane(gray_buffer, gray_width, gray_height, &result);
+    bool seen = false, seen2 = false;
+    int found = decode_plane(gray_buffer, gray_width, gray_height, &result, &seen);
     if (!found) {
         filter_half();
-        found = decode_plane(gray_buffer, gray_width, gray_height, &result);
+        found = decode_plane(gray_buffer, gray_width, gray_height, &result, &seen2);
+        seen = seen || seen2;
     }
-    /* The third attempt costs more than the first two together and only
-     * helps codes that are small in the frame, which stay in view for many
-     * frames anyway. Running it on every frame without a hit made the
-     * device unresponsive while scanning and lost parts of animated QR codes
-     * from a screen, where many frames catch a change between two parts. */
-    bool full_attempt = !found && ++full_attempt_turn >= FULL_ATTEMPT_EVERY;
+    /* The third attempt costs more than the first two together. It runs
+     * at once when the half-size plane shows a code it could not read - a
+     * dense code, such as a static PSBT from a screen, needs the full
+     * resolution. Otherwise only on every few frames, for codes too small
+     * to be located at half size: running it on every empty frame made the
+     * device unresponsive while scanning and lost parts of animated QR
+     * codes, where many frames catch a change between two parts. */
+    bool full_attempt = !found && (seen || ++full_attempt_turn >= FULL_ATTEMPT_EVERY);
     if (full_attempt) {
         full_attempt_turn = 0;
         rgb565_to_full(frame);
@@ -702,7 +728,7 @@ esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length) {
     p4camera_release();
     if (full_attempt) {
         filter_full();
-        found = decode_plane(full_buffer, frame_width, frame_height, &result);
+        found = decode_plane(full_buffer, frame_width, frame_height, &result, &seen);
     }
     if (!found) {
         return ESP_ERR_NOT_FOUND;
