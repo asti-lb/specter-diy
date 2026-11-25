@@ -473,6 +473,11 @@ void p4camera_gray_size(uint16_t *width, uint16_t *height) {
 #define FULL_MEAN_RADIUS  24
 #define FULL_MEAN_PERCENT 15
 
+/* Run the third attempt on every n-th frame in which the first two found
+ * nothing. */
+#define FULL_ATTEMPT_EVERY 3
+static uint8_t full_attempt_turn;
+
 /* Every scan buffer may hold a picture of a seed, or a filtered copy of it.
  * Blank them all in one place, so a buffer added later cannot be missed by
  * one of the callers: flush, closing the scan screen, and freeing. */
@@ -573,25 +578,35 @@ static inline uint16_t rgb565_luma(uint16_t pixel) {
     return (uint16_t)(((r << 3) * 2 + (g << 2) * 5 + (b << 3)) / 8);
 }
 
-/* Full-resolution luminance into full_buffer, and its 2x2 mean into
- * gray_buffer. Averaging rather than sampling every second pixel halves the
- * sensor noise and keeps thin features such as the grid lines of a
- * hand-filled SeedQR template from aliasing into ragged dark specks. */
+/* 2x2 mean of the luminance into gray_buffer, straight from the frame.
+ * Averaging rather than sampling every second pixel halves the sensor noise
+ * and keeps thin features such as the grid lines of a hand-filled SeedQR
+ * template from aliasing into ragged dark specks.
+ *
+ * Each pixel is truncated to 8 bits before the sum, exactly as when the
+ * full-resolution plane was built first, so gray_buffer is bit for bit the
+ * same - it just no longer needs a pass over full_buffer on every frame. */
 static void rgb565_to_gray(const uint8_t *src) {
+    const uint16_t *pixels = (const uint16_t *)src;
+    for (uint16_t y = 0; y < gray_height; ++y) {
+        const uint16_t *row0 = pixels + (size_t)(y * GRAY_DOWNSCALE) * frame_width;
+        const uint16_t *row1 = row0 + frame_width;
+        uint8_t *out = gray_buffer + (size_t)y * gray_width;
+        for (uint16_t x = 0; x < gray_width; ++x) {
+            uint16_t x0 = x * GRAY_DOWNSCALE;
+            uint16_t sum = (uint8_t)rgb565_luma(row0[x0]) + (uint8_t)rgb565_luma(row0[x0 + 1]) +
+                           (uint8_t)rgb565_luma(row1[x0]) + (uint8_t)rgb565_luma(row1[x0 + 1]);
+            out[x] = (uint8_t)((sum + 2) >> 2);
+        }
+    }
+}
+
+/* Full-resolution luminance into full_buffer, only for the third attempt. */
+static void rgb565_to_full(const uint8_t *src) {
     const uint16_t *pixels = (const uint16_t *)src;
     size_t count = (size_t)frame_width * frame_height;
     for (size_t i = 0; i < count; ++i) {
         full_buffer[i] = (uint8_t)rgb565_luma(pixels[i]);
-    }
-    for (uint16_t y = 0; y < gray_height; ++y) {
-        const uint8_t *row0 = full_buffer + (size_t)(y * GRAY_DOWNSCALE) * frame_width;
-        const uint8_t *row1 = row0 + frame_width;
-        uint8_t *out = gray_buffer + (size_t)y * gray_width;
-        for (uint16_t x = 0; x < gray_width; ++x) {
-            uint16_t x0 = x * GRAY_DOWNSCALE;
-            uint16_t sum = row0[x0] + row0[x0 + 1] + row1[x0] + row1[x0 + 1];
-            out[x] = (uint8_t)((sum + 2) >> 2);
-        }
     }
 }
 
@@ -660,19 +675,32 @@ esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length) {
     if (preview_width && preview_buffer) {
         render_preview(frame);
     }
-    p4camera_release();
 
     k_quirc_result_t result;
     /* Cheap attempt first: the half-size plane as it is, which reads clean
      * codes. Then the same plane with grid lines closed and a tile
      * threshold, for hand-filled templates and dim light. Last, the
-     * full-resolution plane with a mean threshold. */
+     * full-resolution plane with a mean threshold.
+     *
+     * The frame is held until it is clear whether the third attempt runs,
+     * because only then is the full-resolution plane built from it. */
     int found = decode_plane(gray_buffer, gray_width, gray_height, &result);
     if (!found) {
         filter_half();
         found = decode_plane(gray_buffer, gray_width, gray_height, &result);
     }
-    if (!found) {
+    /* The third attempt costs more than the first two together and only
+     * helps codes that are small in the frame, which stay in view for many
+     * frames anyway. Running it on every frame without a hit made the
+     * device unresponsive while scanning and lost parts of animated QR codes
+     * from a screen, where many frames catch a change between two parts. */
+    bool full_attempt = !found && ++full_attempt_turn >= FULL_ATTEMPT_EVERY;
+    if (full_attempt) {
+        full_attempt_turn = 0;
+        rgb565_to_full(frame);
+    }
+    p4camera_release();
+    if (full_attempt) {
         filter_full();
         found = decode_plane(full_buffer, frame_width, frame_height, &result);
     }
@@ -705,6 +733,7 @@ void p4camera_flush(void) {
         last_capture_us = esp_timer_get_time();
     }
     blank_scan_buffers();
+    full_attempt_turn = 0;
     if (preview_buffer) {
         memset(preview_buffer, 0, preview_capacity * sizeof(uint16_t));
     }
