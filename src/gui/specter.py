@@ -5,6 +5,8 @@ from .screens import (
     MnemonicScreen,
     NewMnemonicScreen,
     RecoverMnemonicScreen,
+    DiceMnemonicScreen,
+    DiceScreen,
     DevSettings,
 )
 import asyncio
@@ -26,6 +28,23 @@ class SpecterGUI(AsyncGUI):
         Generates a new mnemonic and shows it on the screen
         """
         scr = NewMnemonicScreen(generator, wordlist, fix)
+        await self.load_screen(scr)
+        return await scr.result()
+
+    async def dice_rolls(self, num_rolls):
+        """
+        Asks the user to roll his dice num_rolls times.
+        Returns the rolls as a bytearray, or None if he cancelled.
+        """
+        scr = DiceScreen(num_rolls)
+        await self.load_screen(scr)
+        return await scr.result()
+
+    async def dice_mnemonic(self, mnemonic: str):
+        """
+        Shows a mnemonic generated from dice rolls and asks to confirm it
+        """
+        scr = DiceMnemonicScreen(mnemonic)
         await self.load_screen(scr)
         return await scr.result()
 

@@ -26,7 +26,13 @@ from gui.screens.settings import HostSettings
 from gui.screens.mnemonic import MnemonicPrompt
 
 # small helper functions
-from helpers import gen_mnemonic, fix_mnemonic
+from helpers import (
+    gen_mnemonic,
+    fix_mnemonic,
+    mnemonic_from_dice,
+    DICE_ROLLS_12WORD,
+    DICE_ROLLS_24WORD,
+)
 from errors import BaseError
 from keystore.core import KeyStoreUnavailable
 
@@ -263,6 +269,7 @@ class Specter:
             # id, text
             (None, "Key management"),
             (0, "Generate new key"),
+            (4, "Generate key from dice"),
             (1, "Enter recovery phrase"),
             (777, "Import recovery phrase"),
         ]
@@ -298,6 +305,8 @@ class Specter:
             return self.mainmenu
         elif menuitem == 3:
             await self.update_devsettings()
+        elif menuitem == 4:
+            return await self.generate_from_dice()
         elif menuitem == 777:
             return await self.import_mnemonic()
         elif menuitem == 778:
@@ -310,6 +319,42 @@ class Specter:
         else:
             print(menuitem, "menu is not implemented yet")
             raise SpecterError("Not implemented")
+
+    async def generate_from_dice(self):
+        """Generates a mnemonic from dice rolls entered by the user"""
+        wordcount = await self.gui.menu(
+            [
+                (12, "12 words - %d rolls" % DICE_ROLLS_12WORD),
+                (24, "24 words - %d rolls" % DICE_ROLLS_24WORD),
+            ],
+            title="Generate key from dice",
+            note="Roll your dice and enter the results.\n"
+            "Nothing is stored - if the device restarts\n"
+            "you start over. Do this where nobody can watch.\n"
+            "Your written notes are your key - destroy them\n"
+            "or keep them as safe as your recovery phrase.",
+            last=(255, None),
+        )
+        if wordcount == 12:
+            num_rolls = DICE_ROLLS_12WORD
+        elif wordcount == 24:
+            num_rolls = DICE_ROLLS_24WORD
+        else:
+            return
+        rolls = await self.gui.dice_rolls(num_rolls)
+        if rolls is None:
+            return
+        try:
+            mnemonic = mnemonic_from_dice(rolls)
+        finally:
+            # the rolls are the seed - don't keep them around
+            if isinstance(rolls, bytearray):
+                for i in range(len(rolls)):
+                    rolls[i] = 0
+        mnemonic = await self.gui.dice_mnemonic(mnemonic)
+        if mnemonic is None:
+            return
+        return self.set_mnemonic(mnemonic, "")
 
     async def import_mnemonic(self):
         host = await self.gui.menu(title="What to use for import?", note="\n",
