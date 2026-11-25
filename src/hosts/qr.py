@@ -840,8 +840,11 @@ class QRHost(Host):
         # read all available data
         if self.uart.any() > 0:
             if not self.animated:  # read only one QR code
-                # let all data to come on the first QR code
-                await asyncio.sleep(self.chunk_timeout)
+                # let all data to come on the first QR code - a serial
+                # scanner sends it in pieces, the camera hands over the
+                # complete payload at once
+                if not getattr(self.uart, "is_camera", False):
+                    await asyncio.sleep(self.chunk_timeout)
                 d = self.uart.read()
                 if d is None or len(d) < len(self.EOL):
                     raise ValueError("Failed to read data from scanner")
