@@ -81,3 +81,41 @@ class Modal(lv.obj):
             self.label.center()
 
         self.mbox.align(lv.ALIGN.CENTER, 0, 0)
+
+
+def confirm_exit(scr, text, on_confirm,
+                 stay_text="No, stay here", leave_text="Yes, leave"):
+    """
+    Asks the user to confirm leaving the screen, discarding what he entered.
+    Calls on_confirm() if he confirms, otherwise just closes the dialog.
+    Returns the modal.
+    """
+    # imported here: common imports the components package
+    from ..common import add_button, add_button_label, BTN_HEIGHT
+    from ..decorators import on_release
+
+    gap = 15
+    modal = Modal(scr)
+    modal.set_text(text)
+    modal.mbox.update_layout()
+    text_height = modal.label.get_height()
+    inner_width = modal.mbox.get_width() - 40  # mbox pad_all(20)
+    height = text_height + 2 * gap + 2 * BTN_HEIGHT + 40
+    modal.mbox.set_height(min(height, modal.get_height() - 2 * Modal.DIALOG_MARGIN))
+    modal.mbox.remove_flag(lv.obj.FLAG.SCROLLABLE)
+    modal.label.align(lv.ALIGN.TOP_MID, 0, 0)
+    modal.mbox.align(lv.ALIGN.CENTER, 0, 0)
+
+    def stay():
+        modal.delete_async()
+
+    # stacked rather than side by side: the labels do not fit in half the
+    # dialog width at the button font size
+    stay_btn = add_button(scr=modal.mbox, callback=on_release(stay))
+    leave_btn = add_button(scr=modal.mbox, callback=on_release(on_confirm))
+    for i, (btn, txt) in enumerate([(stay_btn, stay_text), (leave_btn, leave_text)]):
+        btn.set_width(inner_width)
+        btn.set_align(lv.ALIGN.DEFAULT)
+        btn.set_pos(0, text_height + gap + i * (BTN_HEIGHT + gap))
+        add_button_label(btn, txt)
+    return modal

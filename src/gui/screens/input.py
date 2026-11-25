@@ -6,8 +6,10 @@ import lvgl as lv
 from ..common import *
 from ..decorators import *
 from ..components import ButtonMatrix, HintKeyboard
+from ..components.modal import confirm_exit
 from ..common import add_label
 from .screen import Screen
+from helpers import DICE_ROLLS_12WORD, DICE_ROLLS_24WORD
 import rng
 
 
@@ -474,3 +476,256 @@ class NumericScreen(Screen):
             self.ta.set_text("")
         else:
             self.ta.add_text(c)
+
+
+class DiceScreen(Screen):
+    """
+    Collects dice rolls to generate a mnemonic from them.
+    Returns a bytearray with one ASCII digit "1".."6" per roll,
+    or None if the user cancelled.
+    """
+
+    # dice faces as (column, row) of the pips in a 3x3 grid
+    PIPS = {
+        1: [(1, 1)],
+        2: [(0, 0), (2, 2)],
+        3: [(0, 0), (1, 1), (2, 2)],
+        4: [(0, 0), (2, 0), (0, 2), (2, 2)],
+        5: [(0, 0), (2, 0), (1, 1), (0, 2), (2, 2)],
+        6: [(0, 0), (0, 1), (0, 2), (2, 0), (2, 1), (2, 2)],
+    }
+    DICE_W = 142
+    DICE_H = 132
+    DICE_GAP = 18
+    DICE_Y = 300
+    PIP_SIZE = 20
+    UNDO_H = 64
+    # gap between the dice and undo, larger than the gap between the dice
+    # themselves so a low tap on "5" does not remove a roll
+    UNDO_GAP = 28
+    # rolls per line, so 50 rolls are exactly one line
+    ROLLS_PER_LINE = 50
+    ROLLS_PER_GROUP = 5
+
+    def __init__(
+        self,
+        num_rolls,
+        title="Dice roll 1/%d",
+        note="Roll your dice and tap what you rolled.\n"
+        "Keep the screen out of sight.",
+    ):
+        super().__init__()
+        if num_rolls not in (DICE_ROLLS_12WORD, DICE_ROLLS_24WORD):
+            raise RuntimeError("Invalid number of dice rolls")
+        self.num_rolls = num_rolls
+        # fixed-size buffer so it is never reallocated - a growing bytearray
+        # would leave copies of the rolls behind on the heap
+        self.rolls = bytearray(num_rolls)
+        self.count = 0
+        self.modal = None
+
+        self.title = add_label(title % num_rolls, scr=self, y=PADDING, style="title")
+
+        self.bar = lv.bar(self)
+        self.bar.set_size(HOR_RES - 2 * PADDING, 8)
+        self.bar.set_range(0, num_rolls)
+        self.bar.set_value(0, False)
+        self.bar.set_pos(PADDING, 85)
+
+        # rolls entered so far, grouped in fives so they can be checked
+        # against a written record
+        self.sequence_style = lv.style_t()
+        self.sequence_style.init()
+        self.sequence_style.set_text_font(lv.font_montserrat_16)
+        self.sequence_style.set_text_color(styles["ctxt"])
+        # 50 rolls in groups of five are 59 characters and only fit with a
+        # slightly tighter letter spacing
+        self.sequence_style.set_text_letter_space(-1)
+        self.sequence_style.set_text_line_space(8)
+        self.sequence = lv.label(self)
+        self.sequence.add_style(self.sequence_style, 0)
+        self.sequence.set_long_mode(lv.label.LONG_MODE.WRAP)
+        self.sequence.set_width(HOR_RES - 2 * PADDING)
+        # left aligned, so the digits stay put as the line grows and both
+        # lines line up with each other
+        self.sequence.set_style_text_align(lv.TEXT_ALIGN.LEFT, 0)
+        self.sequence.set_text("")
+        self.sequence.set_pos(PADDING, 110)
+
+        self.note = add_label(note, scr=self, y=190, style="hint")
+
+        self.pip_style = lv.style_t()
+        self.pip_style.init()
+        self.pip_style.set_bg_color(styles["ctxt"])
+        self.pip_style.set_bg_opa(255)
+        self.pip_style.set_radius(self.PIP_SIZE // 2)
+        self.pip_style.set_border_width(0)
+        self.pip_style.set_outline_width(0)
+        self.pip_style.set_shadow_width(0)
+        self.pip_style.set_pad_all(0)
+
+        self.dice_style = lv.style_t()
+        self.dice_style.init()
+        self.dice_style.set_radius(20)
+
+        # dimmed while a button can not be used
+        self.disabled_style = lv.style_t()
+        self.disabled_style.init()
+        self.disabled_style.set_opa(lv.OPA._40)
+
+        # dice buttons, 3 columns x 2 rows
+        # separate buttons instead of a button matrix: a matrix has no
+        # spacing between its keys, so a touch that lands slightly off hits
+        # the neighbouring value. Here it lands between two buttons and does
+        # nothing at all, which the counter shows. A wrong roll would
+        # otherwise go unnoticed - unlike a mistyped PIN.
+        # The keys are not shuffled and keep their press feedback, unlike
+        # PinScreen: 50-99 taps cover all six keys anyway, so the smudge
+        # pattern carries no information, and the rolls are on screen in
+        # plain sight regardless.
+        x0 = (HOR_RES - 3 * self.DICE_W - 2 * self.DICE_GAP) // 2
+        self.dice = []
+        for value in range(1, 7):
+            col = (value - 1) % 3
+            row = (value - 1) // 3
+            btn = add_button(
+                scr=self,
+                callback=on_release(cb_with_args(self.add_roll, value)),
+            )
+            btn.add_style(self.dice_style, 0)
+            btn.add_style(self.dice_style, lv.STATE.PRESSED)
+            btn.add_style(self.disabled_style, lv.STATE.DISABLED)
+            btn.set_align(lv.ALIGN.DEFAULT)
+            btn.set_size(self.DICE_W, self.DICE_H)
+            btn.set_pos(
+                x0 + col * (self.DICE_W + self.DICE_GAP),
+                self.DICE_Y + row * (self.DICE_H + self.DICE_GAP),
+            )
+            self.add_pips(btn, value)
+            self.dice.append(btn)
+
+        self.undo_button = add_button(scr=self, callback=on_release(self.undo))
+        self.undo_button.add_style(self.disabled_style, lv.STATE.DISABLED)
+        self.undo_button.set_align(lv.ALIGN.DEFAULT)
+        self.undo_button.set_size(self.DICE_W, self.UNDO_H)
+        self.undo_button.set_pos(
+            (HOR_RES - self.DICE_W) // 2,
+            self.DICE_Y + 2 * self.DICE_H + self.DICE_GAP + self.UNDO_GAP,
+        )
+        add_button_label(self.undo_button, lv.SYMBOL.LEFT + " Undo")
+
+        self.cancel_button = add_button(scr=self, callback=on_release(self.cancel))
+        self.cancel_label = add_button_label(self.cancel_button, lv.SYMBOL.LEFT + " Cancel")
+        self.done_button = add_button(scr=self, callback=on_release(self.confirm))
+        self.done_button.add_style(self.disabled_style, lv.STATE.DISABLED)
+        self.done_label = add_button_label(self.done_button, lv.SYMBOL.OK + " Done")
+        align_button_pair(self.cancel_button, self.done_button)
+        center_button_label(self.cancel_label)
+        center_button_label(self.done_label)
+
+        self.update()
+
+    def add_pips(self, btn, value):
+        """Draws the pips of one die face"""
+        cx = [self.DICE_W // 4, self.DICE_W // 2, 3 * self.DICE_W // 4]
+        cy = [self.DICE_H // 4, self.DICE_H // 2, 3 * self.DICE_H // 4]
+        for col, row in self.PIPS[value]:
+            pip = lv.obj(btn)
+            pip.remove_style_all()
+            pip.add_style(self.pip_style, 0)
+            pip.set_size(self.PIP_SIZE, self.PIP_SIZE)
+            pip.set_pos(cx[col] - self.PIP_SIZE // 2, cy[row] - self.PIP_SIZE // 2)
+            pip.remove_flag(lv.obj.FLAG.CLICKABLE)
+            pip.remove_flag(lv.obj.FLAG.SCROLLABLE)
+
+    def format_rolls(self):
+        """Rolls in groups of five, ROLLS_PER_LINE per line"""
+        lines = []
+        for start in range(0, self.count, self.ROLLS_PER_LINE):
+            line = self.rolls[start : min(start + self.ROLLS_PER_LINE, self.count)]
+            lines.append(
+                " ".join(
+                    [
+                        line[i : i + self.ROLLS_PER_GROUP].decode()
+                        for i in range(0, len(line), self.ROLLS_PER_GROUP)
+                    ]
+                )
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def set_enabled(btn, enabled):
+        if enabled:
+            btn.remove_state(lv.STATE.DISABLED)
+        else:
+            btn.add_state(lv.STATE.DISABLED)
+
+    def update(self):
+        """
+        Updates counter, progress bar, rolls and button states.
+
+        The checks in add_roll(), undo() and confirm() enforce the roll
+        count on their own, disabling the buttons is not relied upon.
+        """
+        done = self.count == self.num_rolls
+        if done:
+            self.title.set_text("All %d rolls entered" % self.num_rolls)
+        else:
+            self.title.set_text("Dice roll %d/%d" % (self.count + 1, self.num_rolls))
+        self.bar.set_value(self.count, False)
+        self.sequence.set_text(self.format_rolls())
+        for btn in self.dice:
+            self.set_enabled(btn, not done)
+        self.set_enabled(self.done_button, done)
+        self.set_enabled(self.undo_button, self.count > 0)
+
+    def add_roll(self, value):
+        if self.count >= self.num_rolls:
+            return
+        self.rolls[self.count] = 0x30 + value  # "1".."6"
+        self.count += 1
+        self.update()
+
+    def undo(self):
+        if self.count == 0:
+            return
+        self.count -= 1
+        self.rolls[self.count] = 0
+        self.update()
+
+    def wipe(self):
+        """Overwrites the rolls - they are the seed"""
+        for i in range(len(self.rolls)):
+            self.rolls[i] = 0
+        self.count = 0
+        self.update()
+
+    def confirm(self):
+        if self.count != self.num_rolls:
+            return
+        # the caller derives from the rolls and overwrites them afterwards,
+        # so only the display is cleared here
+        self.sequence.set_text("")
+        self.set_value(self.rolls)
+
+    def cancel(self):
+        if self.count == 0:
+            self.set_value(None)
+            return
+        if self.modal is not None:
+            return
+        self.modal = confirm_exit(
+            self,
+            "Are you sure you want to exit?\n\n"
+            "All %d dice rolls will be forgotten!" % self.count,
+            self.discard,
+        )
+        # forget the modal once it is closed with "stay"
+        self.modal.add_event_cb(lambda e: self.forget_modal(), lv.EVENT.DELETE, None)
+
+    def forget_modal(self):
+        self.modal = None
+
+    def discard(self):
+        self.wipe()
+        self.set_value(None)

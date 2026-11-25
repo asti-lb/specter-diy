@@ -173,6 +173,33 @@ class NewMnemonicScreen(MnemonicScreen):
         self.set_value(self.table.get_mnemonic())
 
 
+class DiceMnemonicScreen(MnemonicScreen):
+    """
+    Shows a mnemonic generated from dice rolls.
+    Unlike NewMnemonicScreen it has no word count switch and no word editor:
+    the number of words follows from the number of rolls, and editing a word
+    would break the mnemonic's reproducibility from the written down rolls.
+    """
+
+    def __init__(
+        self,
+        mnemonic,
+        title="Your recovery phrase:",
+        note="Write it down and never show it to anybody.",
+    ):
+        super().__init__(mnemonic, title, note)
+        self.table.align_to(self.title, lv.ALIGN.OUT_BOTTOM_MID, 0, 50)
+        self.close_label.set_text(lv.SYMBOL.LEFT + " Back")
+        self.done_button = add_button(scr=self, callback=on_release(self.confirm))
+        self.done_label = add_button_label(self.done_button, lv.SYMBOL.OK + " Done")
+        align_button_pair(self.close_button, self.done_button)
+        center_button_label(self.close_label)
+        center_button_label(self.done_label)
+
+    def confirm(self):
+        self.set_value(self.table.get_mnemonic())
+
+
 class RecoverMnemonicScreen(MnemonicScreen):
     # button indexes
     BTN_NEXT = 28
