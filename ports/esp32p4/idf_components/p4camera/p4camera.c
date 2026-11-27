@@ -36,16 +36,22 @@
 #include "esp_video_device.h"
 #include "esp_video_init.h"
 #include "esp_video_ioctl.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "k_quirc.h"
 #include "linux/videodev2.h"
 #include "qrfilter.h"
 
 #define OV5647_SCCB_ADDR 0x36
 #define SC2336_SCCB_ADDR 0x30
-#define BUFFER_COUNT     2
+/* Three, because while scanning the decoder holds one frame until it has
+ * built its planes from it, the grab task holds the newest one for the
+ * preview, and the driver needs one more to fill. */
+#define BUFFER_COUNT     3
 /* Igual ao Kern: sem timeout o VIDIOC_DQBUF espera para sempre quando nenhum
- * quadro chega, e como scan() roda no loop do MicroPython isso congela o app
- * inteiro -- spinner parado na tela, sem erro nenhum. */
+ * quadro chega. The grab task also checks between two frames whether it is
+ * asked to stop. */
 #define DQBUF_TIMEOUT_MS 100
 /* A pause between two captures longer than this means the frames waiting in
  * the driver queue are from before the pause, see drop_queued_frames(). */
@@ -95,6 +101,12 @@ static bool streaming;
  * novo depois de um deinit (ou de uma falha no meio do init) falha, e a camera
  * so voltaria reiniciando a placa. Fica inicializado ate o reset. */
 static bool video_driver_ready;
+
+/* Scanning runs in two tasks on the core MicroPython does not use, see
+ * "Scan tasks" below. Declared here because deinit, capture and the
+ * preview functions stop them or share their lock. */
+static SemaphoreHandle_t scan_lock;
+static void join_scan_tasks(void);
 
 /* Declarado em p4board.h; evitamos incluir o header do board aqui para manter
  * este componente independente da BSP. */
@@ -283,6 +295,7 @@ static void blank_scan_buffers(void);
 static void free_scan_buffers(void);
 
 void p4camera_deinit(void) {
+    join_scan_tasks();
     if (video_fd >= 0) {
         if (streaming) {
             int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -362,6 +375,9 @@ esp_err_t p4camera_capture(uint8_t **data, size_t *length) {
     if (video_fd < 0 || !streaming) {
         return ESP_ERR_INVALID_STATE;
     }
+    /* Direct capture (test and measuring scripts) and the scan tasks would
+     * dequeue from the same driver queue. */
+    join_scan_tasks();
     if (holding_frame) {
         /* Segurar dois quadros esgota a fila de dois buffers e trava o
          * streaming. Devolver antes de pegar o proximo. */
@@ -387,11 +403,27 @@ esp_err_t p4camera_capture(uint8_t **data, size_t *length) {
 
 /* ------------------------------- Previa --------------------------------- */
 
+/* preview_buffer is what the screen shows. The grab task renders into
+ * preview_stage instead, on the other core; p4camera_preview_frames(),
+ * called from the screen, copies the newest stage frame over under
+ * scan_lock. So the task never writes the buffer LVGL is reading, and the
+ * preview cannot tear. */
 static uint16_t *preview_buffer;
+static uint16_t *preview_stage;
 static size_t preview_capacity;
 static uint16_t preview_width;
 static uint16_t preview_height;
-static volatile uint32_t preview_frames;
+static uint32_t preview_frames;
+static uint32_t stage_frames;
+
+static void blank_preview(void) {
+    if (preview_buffer) {
+        memset(preview_buffer, 0, preview_capacity * sizeof(uint16_t));
+    }
+    if (preview_stage) {
+        memset(preview_stage, 0, preview_capacity * sizeof(uint16_t));
+    }
+}
 
 esp_err_t p4camera_preview_enable(uint16_t width, uint16_t height, uint16_t **buffer) {
     if (width == 0 || height == 0 || !buffer) {
@@ -401,13 +433,20 @@ esp_err_t p4camera_preview_enable(uint16_t width, uint16_t height, uint16_t **bu
     if (!preview_buffer) {
         preview_buffer = heap_caps_calloc(needed, sizeof(uint16_t),
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!preview_buffer) {
+        preview_stage = heap_caps_calloc(needed, sizeof(uint16_t),
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!preview_buffer || !preview_stage) {
+            free(preview_buffer);
+            free(preview_stage);
+            preview_buffer = preview_stage = NULL;
             return ESP_ERR_NO_MEM;
         }
         preview_capacity = needed;
     } else if (needed > preview_capacity) {
         return ESP_ERR_INVALID_SIZE;
     }
+    /* The grab task reads the size while rendering. */
+    join_scan_tasks();
     preview_width = width;
     preview_height = height;
     *buffer = preview_buffer;
@@ -415,23 +454,34 @@ esp_err_t p4camera_preview_enable(uint16_t width, uint16_t height, uint16_t **bu
 }
 
 void p4camera_preview_disable(void) {
+    /* The scan screen is closing. Stop scanning first, so nothing writes
+     * the buffers while they are blanked. The preview buffers outlive the
+     * screen, and the scan buffers still hold the last frame handed to the
+     * decoder: all may show a seed, so blank them now instead of at the
+     * next scan. */
+    join_scan_tasks();
     preview_width = preview_height = 0;
-    /* The scan screen is closing. The preview buffer outlives it, and the
-     * scan buffers still hold the last frame handed to the decoder: both may
-     * show a seed, so blank them now instead of at the next scan. */
-    if (preview_buffer) {
-        memset(preview_buffer, 0, preview_capacity * sizeof(uint16_t));
-    }
+    blank_preview();
     blank_scan_buffers();
 }
 
 uint32_t p4camera_preview_frames(void) {
+    if (preview_buffer && scan_lock) {
+        xSemaphoreTake(scan_lock, portMAX_DELAY);
+        if (stage_frames != preview_frames) {
+            memcpy(preview_buffer, preview_stage,
+                (size_t)preview_width * preview_height * sizeof(uint16_t));
+            preview_frames = stage_frames;
+        }
+        xSemaphoreGive(scan_lock);
+    }
     return preview_frames;
 }
 
 /* Recorta o centro quadrado do quadro RGB565 e reduz por vizinho mais
  * proximo. Quadrado porque o QR e quadrado; o centro porque e para onde a
- * pessoa aponta. Passo em ponto fixo 16.16 para nao dividir por pixel. */
+ * pessoa aponta. Passo em ponto fixo 16.16 para nao dividir por pixel.
+ * Runs in the grab task, with scan_lock held. */
 static void render_preview(const uint8_t *src) {
     const uint16_t *pixels = (const uint16_t *)src;
     uint16_t side = frame_width < frame_height ? frame_width : frame_height;
@@ -439,7 +489,7 @@ static void render_preview(const uint8_t *src) {
     uint16_t y0 = (frame_height - side) / 2;
     uint32_t step_x = ((uint32_t)side << 16) / preview_width;
     uint32_t step_y = ((uint32_t)side << 16) / preview_height;
-    uint16_t *out = preview_buffer;
+    uint16_t *out = preview_stage;
     uint32_t fy = 0;
     for (uint16_t y = 0; y < preview_height; ++y, fy += step_y) {
         const uint16_t *row = pixels + (size_t)(y0 + (fy >> 16)) * frame_width + x0;
@@ -448,7 +498,7 @@ static void render_preview(const uint8_t *src) {
             *out++ = row[fx >> 16];
         }
     }
-    preview_frames++;
+    stage_frames++;
 }
 
 /* --------------------------------- QR ----------------------------------- */
@@ -672,6 +722,265 @@ static int decode_plane(const uint8_t *plane, uint16_t w, uint16_t h,
     return found;
 }
 
+/* ----------------------------- Scan tasks ------------------------------- */
+
+/* MicroPython, LVGL and touch run in one task on core 1. Decoding a frame
+ * takes up to about half a second, and while camera.scan() did it in that
+ * task the preview, touch and the rest of the device stood still, and
+ * animated codes lost parts. Now two tasks on core 0 do the work:
+ *
+ *   grab   - dequeues every frame, renders the preview from it, and hands
+ *            it to the decoder when the decoder is free. All driver calls
+ *            while scanning come from this task.
+ *   decode - builds the planes from the frame, returns the frame, runs the
+ *            three attempts and leaves a result for p4camera_scan().
+ *
+ * The grab task has the higher priority: a frame comes every few tens of
+ * ms, rendering it is short, and the decoder continues in between.
+ *
+ * camera.scan() only starts the tasks and picks up a result. When it has
+ * not been called for IDLE_STOP_US (the scan ended or the app is busy
+ * elsewhere), the tasks stop by themselves and blank what they held; the
+ * next scan() starts them again. flush, closing the preview, capture and
+ * deinit stop them and wait until they are gone (join_scan_tasks), so a
+ * frame or result of a previous session cannot appear later. */
+#define SCAN_CORE        0
+#define GRAB_PRIORITY    3
+#define DECODE_PRIORITY  2
+#define GRAB_STACK       4096
+/* quirc keeps a bitmap of up to 4 KB on the stack while decoding. */
+#define DECODE_STACK     16384
+#define IDLE_STOP_US     1000000
+
+static TaskHandle_t grab_handle;
+static TaskHandle_t decode_handle;
+static SemaphoreHandle_t grab_exited;
+static SemaphoreHandle_t decode_exited;
+/* Tasks created and not yet joined. Only changed from the MicroPython
+ * side. */
+static bool tasks_alive;
+/* Set by join_scan_tasks() or by the grab task when idle. */
+static volatile bool stop_requested;
+static volatile int64_t last_poll_us;
+
+/* Frame handoff, under scan_lock. decode_buf is the frame lent to the
+ * decoder (decode_lent); the decoder sets decode_returned when it no
+ * longer reads the frame, and the grab task requeues it. decode_busy lasts
+ * until the decoder has finished all attempts. */
+static struct v4l2_buffer decode_buf;
+static bool decode_lent;
+static bool decode_returned;
+static bool decode_busy;
+
+/* Result for p4camera_scan(), under scan_lock. decode_result is the
+ * decoder's own scratch; both may hold a seed and are blanked after use. */
+static uint8_t result_payload[K_QUIRC_MAX_PAYLOAD];
+static size_t result_length;
+static k_quirc_result_t decode_result;
+
+static void lock(void) {
+    xSemaphoreTake(scan_lock, portMAX_DELAY);
+}
+
+static void unlock(void) {
+    xSemaphoreGive(scan_lock);
+}
+
+static void blank_result(void) {
+    memset(result_payload, 0, sizeof(result_payload));
+    result_length = 0;
+}
+
+static void return_decoder_frame(void) {
+    lock();
+    decode_returned = true;
+    unlock();
+}
+
+/* The three attempts on one frame. Returns the frame as soon as the
+ * planes are built from it. */
+static bool decode_one(const uint8_t *frame) {
+    k_quirc_result_t *result = &decode_result;
+    rgb565_to_gray(frame);
+    /* Cheap attempt first: the half-size plane as it is, which reads clean
+     * codes. Then the same plane with grid lines closed and a tile
+     * threshold, for hand-filled templates and dim light. Last, the
+     * full-resolution plane with a mean threshold.
+     *
+     * The frame is held until it is clear whether the third attempt runs,
+     * because only then is the full-resolution plane built from it. */
+    bool seen = false, seen2 = false;
+    int found = decode_plane(gray_buffer, gray_width, gray_height, result, &seen);
+    if (!found) {
+        filter_half();
+        found = decode_plane(gray_buffer, gray_width, gray_height, result, &seen2);
+        seen = seen || seen2;
+    }
+    /* The third attempt costs more than the first two together. It runs
+     * at once when the half-size plane shows a code it could not read - a
+     * dense code, such as a static PSBT from a screen, needs the full
+     * resolution. Otherwise only on every few frames, for codes too small
+     * to be located at half size: running it on every empty frame kept the
+     * decoder from the next frames and lost parts of animated QR codes,
+     * where many frames catch a change between two parts. */
+    bool full_attempt = !found && (seen || ++full_attempt_turn >= FULL_ATTEMPT_EVERY);
+    if (full_attempt) {
+        full_attempt_turn = 0;
+        rgb565_to_full(frame);
+    }
+    return_decoder_frame();
+    if (full_attempt) {
+        filter_full();
+        found = decode_plane(full_buffer, frame_width, frame_height, result, &seen);
+    }
+    return found;
+}
+
+static void decode_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (stop_requested) {
+            break;
+        }
+        if (decode_one(buffers[decode_buf.index])) {
+            size_t n = (size_t)decode_result.data.payload_len;
+            lock();
+            /* A result p4camera_scan() has not picked up yet is replaced
+             * by the newer one. */
+            if (n <= sizeof(result_payload)) {
+                memcpy(result_payload, decode_result.data.payload, n);
+                result_length = n;
+            }
+            unlock();
+        }
+        memset(&decode_result, 0, sizeof(decode_result));
+        lock();
+        decode_busy = false;
+        unlock();
+    }
+    blank_scan_buffers();
+    memset(&decode_result, 0, sizeof(decode_result));
+    xSemaphoreGive(decode_exited);
+    vTaskDelete(NULL);
+}
+
+static void requeue_returned_frame(void) {
+    lock();
+    bool requeue = decode_lent && decode_returned;
+    if (requeue) {
+        decode_lent = false;
+    }
+    unlock();
+    if (requeue) {
+        ioctl(video_fd, VIDIOC_QBUF, &decode_buf);
+    }
+}
+
+static void grab_task(void *arg) {
+    (void)arg;
+    while (!stop_requested) {
+        if (esp_timer_get_time() - last_poll_us > IDLE_STOP_US) {
+            break;
+        }
+        requeue_returned_frame();
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(video_fd, VIDIOC_DQBUF, &buf) != 0) {
+            /* No frame within DQBUF_TIMEOUT_MS; also lets the idle task
+             * of this core run if the driver fails at once. */
+            vTaskDelay(1);
+            continue;
+        }
+        bool lend = false;
+        lock();
+        if (preview_width && preview_stage) {
+            render_preview(buffers[buf.index]);
+        }
+        if (!decode_busy && !decode_lent) {
+            decode_buf = buf;
+            decode_lent = true;
+            decode_returned = false;
+            decode_busy = true;
+            lend = true;
+        }
+        unlock();
+        if (lend) {
+            xTaskNotifyGive(decode_handle);
+        } else {
+            ioctl(video_fd, VIDIOC_QBUF, &buf);
+        }
+    }
+    /* Stopping, asked for or idle. The decoder may be in the middle of a
+     * frame; wait for it, then give its frame back to the driver. */
+    stop_requested = true;
+    xTaskNotifyGive(decode_handle);
+    xSemaphoreTake(decode_exited, portMAX_DELAY);
+    lock();
+    if (decode_lent) {
+        ioctl(video_fd, VIDIOC_QBUF, &decode_buf);
+        decode_lent = false;
+    }
+    decode_busy = false;
+    blank_result();
+    if (preview_stage) {
+        memset(preview_stage, 0, preview_capacity * sizeof(uint16_t));
+    }
+    unlock();
+    xSemaphoreGive(grab_exited);
+    vTaskDelete(NULL);
+}
+
+/* Stop the scan tasks, if any, and wait until both are gone. Blocks for at
+ * most one decoding pass. MicroPython side only. */
+static void join_scan_tasks(void) {
+    if (!tasks_alive) {
+        return;
+    }
+    stop_requested = true;
+    xSemaphoreTake(grab_exited, portMAX_DELAY);
+    tasks_alive = false;
+    grab_handle = decode_handle = NULL;
+}
+
+static esp_err_t start_scan_tasks(void) {
+    if (!scan_lock) {
+        scan_lock = xSemaphoreCreateMutex();
+        grab_exited = xSemaphoreCreateBinary();
+        decode_exited = xSemaphoreCreateBinary();
+        if (!scan_lock || !grab_exited || !decode_exited) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (holding_frame) {
+        p4camera_release();
+    }
+    /* Frames queued while nobody scanned are from before this scan. */
+    drop_queued_frames();
+    decode_lent = decode_returned = decode_busy = false;
+    stop_requested = false;
+    last_poll_us = esp_timer_get_time();
+    if (xTaskCreatePinnedToCore(decode_task, "qr_decode", DECODE_STACK, NULL,
+            DECODE_PRIORITY, &decode_handle, SCAN_CORE) != pdPASS) {
+        decode_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreatePinnedToCore(grab_task, "qr_grab", GRAB_STACK, NULL,
+            GRAB_PRIORITY, &grab_handle, SCAN_CORE) != pdPASS) {
+        stop_requested = true;
+        xTaskNotifyGive(decode_handle);
+        xSemaphoreTake(decode_exited, portMAX_DELAY);
+        grab_handle = decode_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    tasks_alive = true;
+    return ESP_OK;
+}
+
+/* Never blocks for a frame or a decode: starts the scan tasks if needed
+ * and returns the result they left since the last call, if any. */
 esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length) {
     if (length) *length = 0;
     if (video_fd < 0 || !streaming) {
@@ -682,64 +991,35 @@ esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length) {
          * cobre so o caso que este sensor entrega de fato. */
         return ESP_ERR_NOT_SUPPORTED;
     }
-    esp_err_t err = ensure_gray_buffer();
-    if (err != ESP_OK) {
-        return err;
+    last_poll_us = esp_timer_get_time();
+    if (tasks_alive && stop_requested) {
+        /* Stopped by themselves after a pause in scanning. */
+        join_scan_tasks();
     }
-
-    uint8_t *frame = NULL;
-    size_t frame_length = 0;
-    err = p4camera_capture(&frame, &frame_length);
-    if (err != ESP_OK) {
-        return err;
+    if (!tasks_alive) {
+        esp_err_t err = ensure_gray_buffer();
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = start_scan_tasks();
+        if (err != ESP_OK) {
+            return err;
+        }
     }
-    rgb565_to_gray(frame);
-    if (preview_width && preview_buffer) {
-        render_preview(frame);
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    lock();
+    if (result_length) {
+        if (result_length > capacity) {
+            err = ESP_ERR_INVALID_SIZE;
+        } else {
+            memcpy(payload, result_payload, result_length);
+            if (length) *length = result_length;
+            err = ESP_OK;
+        }
+        blank_result();
     }
-
-    k_quirc_result_t result;
-    /* Cheap attempt first: the half-size plane as it is, which reads clean
-     * codes. Then the same plane with grid lines closed and a tile
-     * threshold, for hand-filled templates and dim light. Last, the
-     * full-resolution plane with a mean threshold.
-     *
-     * The frame is held until it is clear whether the third attempt runs,
-     * because only then is the full-resolution plane built from it. */
-    bool seen = false, seen2 = false;
-    int found = decode_plane(gray_buffer, gray_width, gray_height, &result, &seen);
-    if (!found) {
-        filter_half();
-        found = decode_plane(gray_buffer, gray_width, gray_height, &result, &seen2);
-        seen = seen || seen2;
-    }
-    /* The third attempt costs more than the first two together. It runs
-     * at once when the half-size plane shows a code it could not read - a
-     * dense code, such as a static PSBT from a screen, needs the full
-     * resolution. Otherwise only on every few frames, for codes too small
-     * to be located at half size: running it on every empty frame made the
-     * device unresponsive while scanning and lost parts of animated QR
-     * codes, where many frames catch a change between two parts. */
-    bool full_attempt = !found && (seen || ++full_attempt_turn >= FULL_ATTEMPT_EVERY);
-    if (full_attempt) {
-        full_attempt_turn = 0;
-        rgb565_to_full(frame);
-    }
-    p4camera_release();
-    if (full_attempt) {
-        filter_full();
-        found = decode_plane(full_buffer, frame_width, frame_height, &result, &seen);
-    }
-    if (!found) {
-        return ESP_ERR_NOT_FOUND;
-    }
-    size_t n = (size_t)result.data.payload_len;
-    if (n > capacity) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    memcpy(payload, result.data.payload, n);
-    if (length) *length = n;
-    return ESP_OK;
+    unlock();
+    return err;
 }
 
 esp_err_t p4camera_release(void) {
@@ -751,6 +1031,7 @@ esp_err_t p4camera_release(void) {
 }
 
 void p4camera_flush(void) {
+    join_scan_tasks();
     if (holding_frame) {
         p4camera_release();
     }
@@ -759,8 +1040,7 @@ void p4camera_flush(void) {
         last_capture_us = esp_timer_get_time();
     }
     blank_scan_buffers();
+    blank_result();
     full_attempt_turn = 0;
-    if (preview_buffer) {
-        memset(preview_buffer, 0, preview_capacity * sizeof(uint16_t));
-    }
+    blank_preview();
 }

@@ -99,8 +99,8 @@ static mp_obj_t camera_scan_fn(void) {
     size_t length = 0;
     esp_err_t err = p4camera_scan(payload, sizeof(payload), &length);
     if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_TIMEOUT) {
-        /* Nenhum QR legivel neste quadro, ou o quadro nao chegou a tempo:
-         * casos normais do laco de leitura, nao erro. */
+        /* No code read since the last call: the normal case of the
+         * scan loop, not an error. */
         return mp_const_none;
     }
     check(err, "scan");
@@ -119,8 +119,8 @@ static mp_obj_t camera_gray_size_fn(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_gray_size_obj, camera_gray_size_fn);
 
-/* camera.preview(w, h) -> memoryview RGB565 de w*h*2 bytes, atualizado a cada
- * scan(). O buffer pertence ao driver e nunca e liberado, entao a tela pode
+/* camera.preview(w, h) -> memoryview RGB565 de w*h*2 bytes, updated by
+ * preview_frames() with the newest frame of the scan tasks. O buffer pertence ao driver e nunca e liberado, entao a tela pode
  * continuar apontando para ele. */
 static mp_obj_t camera_preview_fn(mp_obj_t width_obj, mp_obj_t height_obj) {
     mp_int_t width = mp_obj_get_int(width_obj);

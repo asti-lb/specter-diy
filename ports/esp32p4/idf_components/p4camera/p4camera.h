@@ -43,7 +43,8 @@ uint32_t p4camera_format(void);
  * @brief Captura um quadro.
  *
  * Devolve ponteiro para o buffer mapeado do driver, valido ate a proxima
- * chamada de p4camera_capture() ou p4camera_release(). Nao copia.
+ * chamada de p4camera_capture() ou p4camera_release(). Nao copia. Stops
+ * the scan tasks first.
  */
 esp_err_t p4camera_capture(uint8_t **data, size_t *length);
 
@@ -51,16 +52,18 @@ esp_err_t p4camera_capture(uint8_t **data, size_t *length);
 esp_err_t p4camera_release(void);
 
 /**
- * @brief Captura um quadro e tenta decodificar um QR code.
+ * @brief Returns a QR code read since the last call, without waiting.
  *
- * Converte para tons de cinza reduzindo por 2 no caminho: o sensor entrega
- * 1280x960, e decodificar 1,2 milhao de pixels custa caro sem ganho -- QR a
- * 640x480 sobra. O quadro e devolvido ao driver antes de retornar.
+ * The first call starts two tasks on core 0 that grab every frame, render
+ * the preview and decode in the background; they stop by themselves when
+ * scan() is not called for a second. Decoding uses a half-size plane: the
+ * sensor delivers 1280x960, and 640x480 is enough for most codes.
  *
  * @param payload   buffer de saida
  * @param capacity  tamanho de payload
  * @param length    bytes escritos
- * @return ESP_OK se decodificou, ESP_ERR_NOT_FOUND se nao havia QR legivel.
+ * @return ESP_OK with a code, ESP_ERR_NOT_FOUND if none was read since the
+ *         last call.
  */
 esp_err_t p4camera_scan(uint8_t *payload, size_t capacity, size_t *length);
 
@@ -80,7 +83,7 @@ void p4camera_gray_size(uint16_t *width, uint16_t *height);
 
 /**
  * Previa da camera para a tela. Com a previa ligada, cada p4camera_scan()
- * tambem grava em *buffer o centro quadrado do quadro, reduzido para
+ * tambem grava em *buffer (through p4camera_preview_frames()) o centro quadrado do quadro, reduzido para
  * width x height em RGB565 -- o formato do painel e do LVGL.
  *
  * O buffer e alocado na primeira chamada e nunca liberado: a tela pode
@@ -91,7 +94,9 @@ esp_err_t p4camera_preview_enable(uint16_t width, uint16_t height, uint16_t **bu
 /** Para a previa e zera os buffers de previa e de tons de cinza, que podem
  * mostrar uma seed. Chamado quando a tela de leitura fecha. */
 void p4camera_preview_disable(void);
-/** Quantos quadros de previa ja foram gravados; muda a cada quadro novo. */
+/** Copies the newest preview frame into the buffer, if there is one, and
+ * returns how many frames were copied so far; changes with every new frame.
+ * Call it from the task that draws the buffer. */
 uint32_t p4camera_preview_frames(void);
 
 #endif  // P4CAMERA_H
