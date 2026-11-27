@@ -79,6 +79,9 @@ class Base64QREncoder(QREncoder):
     def __getitem__(self, idx):
         idx = idx % len(self)
         self.f.seek(self._start + idx*self.part_len, 0)
+        if len(self) == 1:
+            # plain base64, as any wallet reads a single PSBT QR code
+            return self.f.read(self.part_len)
         return "p%dof%d %s" % (idx+1, len(self), self.f.read(self.part_len))
 
 class LegacyBCUREncoder(QREncoder):
@@ -98,6 +101,8 @@ class LegacyBCUREncoder(QREncoder):
 
     def __getitem__(self, idx):
         if len(self) == 1:
+            # the animation asks for the frame again and again
+            self.f.seek(0, 0)
             return "UR:BYTES/" + self.f.read()
         idx = idx % len(self)
         self.f.seek(self._start + idx*self.part_len, 0)
@@ -138,8 +143,14 @@ class CryptoPSBTEncoder(QREncoder):
 
     @part_len.setter
     def part_len(self, part_len):
+        # part_len is the size of a QR code in bytes, as for the other
+        # encoders (QR_SIZES). Bytewords spell every byte with two capital
+        # letters, which a QR code stores in alphanumeric mode at 5.5 bits
+        # each: 11 bits a byte instead of 8, so a part of the same QR
+        # version carries 8/11 as many bytes.
         if part_len > 2 * self.MAX_PREFIX_LEN:
             part_len -= self.MAX_PREFIX_LEN
+        part_len = max(1, part_len * 8 // 11)
         if self.encoder:
             self.encoder.part_len = part_len
             self._part_len = self.encoder.part_len

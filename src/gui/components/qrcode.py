@@ -71,7 +71,11 @@ class QRCode(lv.obj):
 
     RATE = 500  # ms
     FRAME_SIZE = 300
-    QR_VERSION = 10
+    # Default density, an index into QR_SIZES: about 150 characters a code.
+    # Laptop webcams read a dense code slowly or not at all, and without
+    # feedback; coarse animated parts are read one by one, each at once. The
+    # density buttons still go up to a single dense code.
+    QR_VERSION = 5
     MIN_SIZE = 300
     MAX_SIZE = QR_SIZES[-1]
 
@@ -337,7 +341,9 @@ class QRCode(lv.obj):
         self._text = text
         if isinstance(text, QREncoder):
             self.encoder = text
-            self._text = text.get_full(self.MAX_SIZE)
+            # a single code only if it is not denser than the chosen density
+            self.encoder.part_len = QR_SIZES[self.version]
+            self._text = text.get_full(QR_SIZES[self.version])
             self.frame_num = len(self.encoder)
             if not self._text: # we can't get full data in one QR
                 self.idx = 0
