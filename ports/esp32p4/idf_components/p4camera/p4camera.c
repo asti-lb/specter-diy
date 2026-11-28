@@ -514,7 +514,7 @@ void p4camera_gray_size(uint16_t *width, uint16_t *height) {
 }
 
 /* Second attempt, on the half-size plane: closing 3 x 3 (radius 1) and
- * min/max tiles of 8 px. Third attempt, full resolution: mean threshold over
+ * min/max tiles of 8 px. Last attempt, full resolution: mean threshold over
  * 49 x 49 px (radius 24), dark when 15 % below the mean. Chosen on camera
  * images of SeedSigner and T templates at 10-25 cm, by day and in the
  * evening, and on simulated templates (journal 2.42). */
@@ -523,7 +523,15 @@ void p4camera_gray_size(uint16_t *width, uint16_t *height) {
 #define FULL_MEAN_RADIUS  24
 #define FULL_MEAN_PERCENT 15
 
-/* Run the third attempt on every n-th frame in which the first two found
+/* Sharpened attempt, between the second and the third: unsharp mask on a
+ * fresh half-size plane, 5 x 5 box blur twice, strength 300 %. A code on a
+ * screen seen from close up is out of focus for the fixed-focus lens; the
+ * mask restores its edges. Chosen on camera captures of static PSBTs from
+ * Specter Desktop and on simulated templates (journal 3.22). */
+#define SHARPEN_RADIUS  2
+#define SHARPEN_PERCENT 300
+
+/* Run the full-resolution attempt on every n-th frame in which the others found
  * nothing. */
 #define FULL_ATTEMPT_EVERY 3
 static uint8_t full_attempt_turn;
@@ -585,6 +593,11 @@ static esp_err_t ensure_gray_buffer(void) {
     }
     gray_buffer = heap_caps_aligned_alloc(16, (size_t)width * height, MALLOC_CAP_8BIT);
     full_size = fw * fh;
+    /* full_buffer doubles as the work memory of the sharpened attempt,
+     * which runs before the full-resolution plane is built. */
+    if (qrf_sharpen_work_size(width, height) > full_size) {
+        return ESP_ERR_NO_MEM;
+    }
     full_buffer = heap_caps_aligned_alloc(16, full_size, MALLOC_CAP_8BIT);
     work_size = qrf_close_work_size(width, height, HALF_TILE);
     if (qrf_local_work_size(fw, FULL_MEAN_RADIUS) > work_size) {
@@ -651,7 +664,7 @@ static void rgb565_to_gray(const uint8_t *src) {
     }
 }
 
-/* Full-resolution luminance into full_buffer, only for the third attempt. */
+/* Full-resolution luminance into full_buffer, only for the last attempt. */
 static void rgb565_to_full(const uint8_t *src) {
     const uint16_t *pixels = (const uint16_t *)src;
     size_t count = (size_t)frame_width * frame_height;
@@ -804,10 +817,15 @@ static bool decode_one(const uint8_t *frame) {
     rgb565_to_gray(frame);
     /* Cheap attempt first: the half-size plane as it is, which reads clean
      * codes. Then the same plane with grid lines closed and a tile
-     * threshold, for hand-filled templates and dim light. Last, the
-     * full-resolution plane with a mean threshold.
+     * threshold, for hand-filled templates and dim light. Then a fresh
+     * half-size plane, sharpened, for codes on screens that the lens does
+     * not focus. Last, the full-resolution plane with a mean threshold.
      *
-     * The frame is held until it is clear whether the third attempt runs,
+     * The sharpened plane gets its own attempt rather than feeding the
+     * second one: closing a sharpened SeedQR template no longer removed its
+     * grid lines, and four templates that read before were lost.
+     *
+     * The frame is held until it is clear whether the last attempt runs,
      * because only then is the full-resolution plane built from it. */
     bool seen = false, seen2 = false;
     int found = decode_plane(gray_buffer, gray_width, gray_height, result, &seen);
@@ -816,7 +834,14 @@ static bool decode_one(const uint8_t *frame) {
         found = decode_plane(gray_buffer, gray_width, gray_height, result, &seen2);
         seen = seen || seen2;
     }
-    /* The third attempt costs more than the first two together. It runs
+    if (!found) {
+        rgb565_to_gray(frame);
+        qrf_sharpen(gray_buffer, gray_width, gray_height, SHARPEN_RADIUS, SHARPEN_PERCENT,
+                    full_buffer);
+        found = decode_plane(gray_buffer, gray_width, gray_height, result, &seen2);
+        seen = seen || seen2;
+    }
+    /* The last attempt costs more than the others together. It runs
      * at once when the half-size plane shows a code it could not read - a
      * dense code, such as a static PSBT from a screen, needs the full
      * resolution. Otherwise only on every few frames, for codes too small

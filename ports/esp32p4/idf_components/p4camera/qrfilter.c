@@ -288,6 +288,71 @@ void qrf_local_mean(uint8_t *img, int w, int h, int r, int t, uint8_t *work) {
     }
 }
 
+
+/* ------------------------------------------------------------------------
+ * Unsharp mask
+ *
+ * Each box pass is a horizontal and a vertical running sum with the edge
+ * pixels repeated, so the cost does not depend on r. The division by the
+ * window size 2r+1 is a multiply and shift: m = ceil(65536 / n) gives the
+ * exact quotient for every sum up to 255 * n (n <= 7), because the rounding
+ * error sum * (m*n - 65536) stays below 65536.
+ * ---------------------------------------------------------------------- */
+
+size_t qrf_sharpen_work_size(int w, int h) {
+    return 2 * (size_t)w * h + sizeof(uint16_t) * (size_t)w;
+}
+
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static void box_h(const uint8_t *src, uint8_t *dst, int w, int h, int r, uint32_t m) {
+    for (int y = 0; y < h; ++y) {
+        const uint8_t *s = src + (size_t)y * w;
+        uint8_t *d = dst + (size_t)y * w;
+        uint32_t sum = 0;
+        for (int i = -r; i <= r; ++i) sum += s[clampi(i, 0, w - 1)];
+        for (int x = 0; x < w; ++x) {
+            d[x] = (uint8_t)((sum * m) >> 16);
+            sum += s[clampi(x + r + 1, 0, w - 1)];
+            sum -= s[clampi(x - r, 0, w - 1)];
+        }
+    }
+}
+
+static void box_v(const uint8_t *src, uint8_t *dst, int w, int h, int r, uint32_t m,
+                  uint16_t *col) {
+    for (int x = 0; x < w; ++x) col[x] = 0;
+    for (int i = -r; i <= r; ++i) {
+        const uint8_t *s = src + (size_t)clampi(i, 0, h - 1) * w;
+        for (int x = 0; x < w; ++x) col[x] += s[x];
+    }
+    for (int y = 0; y < h; ++y) {
+        uint8_t *d = dst + (size_t)y * w;
+        const uint8_t *in = src + (size_t)clampi(y + r + 1, 0, h - 1) * w;
+        const uint8_t *out = src + (size_t)clampi(y - r, 0, h - 1) * w;
+        for (int x = 0; x < w; ++x) {
+            d[x] = (uint8_t)((col[x] * m) >> 16);
+            col[x] = (uint16_t)(col[x] + in[x] - out[x]);
+        }
+    }
+}
+
+void qrf_sharpen(uint8_t *img, int w, int h, int r, int k, uint8_t *work) {
+    if (w <= 0 || h <= 0 || r < 1 || r > 3) return;
+    size_t n = (size_t)w * h;
+    uint8_t *a = work, *b = work + n;
+    uint16_t *col = (uint16_t *)(work + 2 * n);
+    uint32_t m = (65536u + 2 * r) / (2 * r + 1);  /* ceil(65536 / (2r+1)) */
+    box_h(img, a, w, h, r, m);
+    box_v(a, b, w, h, r, m, col);
+    box_h(b, a, w, h, r, m);
+    box_v(a, b, w, h, r, m, col);
+    for (size_t i = 0; i < n; ++i) {
+        int p = img[i];
+        img[i] = (uint8_t)clampi(p + k * (p - b[i]) / 100, 0, 255);
+    }
+}
+
 /* ------------------------------------------------------------------------
  * Reference implementations (the code of qr-lab/qrlab.c and of the
  * previous firmware)
@@ -426,9 +491,44 @@ static int test_ops(uint8_t *buf) {
 }
 
 /* kind 0: closing + tiles (radius, tile), kind 1: local mean (radius) */
+
+/* The sharpening of qr-lab/qrlab.c: box passes with plain loops. */
+int qrf_sharpen_ref(uint8_t *img, int w, int h, int r, int k) {
+    size_t n = (size_t)w * h;
+    uint8_t *a = malloc(n), *b = malloc(n);
+    if (!a || !b) {
+        free(a);
+        free(b);
+        return -1;
+    }
+    memcpy(a, img, n);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                int sum = 0;
+                for (int d = -r; d <= r; ++d) sum += a[(size_t)y * w + clampi(x + d, 0, w - 1)];
+                b[(size_t)y * w + x] = (uint8_t)(sum / (2 * r + 1));
+            }
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                int sum = 0;
+                for (int d = -r; d <= r; ++d) sum += b[(size_t)clampi(y + d, 0, h - 1) * w + x];
+                a[(size_t)y * w + x] = (uint8_t)(sum / (2 * r + 1));
+            }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        int p = img[i];
+        img[i] = (uint8_t)clampi(p + k * (p - a[i]) / 100, 0, 255);
+    }
+    free(a);
+    free(b);
+    return 0;
+}
+
 static int test_image(int kind, int w, int h, int radius, int tile, uint32_t seed) {
     size_t n = (size_t)w * h;
-    size_t ws = kind ? qrf_local_work_size(w, radius) : qrf_close_work_size(w, h, tile);
+    size_t ws = kind == 2 ? qrf_sharpen_work_size(w, h)
+              : kind ? qrf_local_work_size(w, radius) : qrf_close_work_size(w, h, tile);
     int bw = (w + tile - 1) / tile, bh = (h + tile - 1) / tile;
     uint8_t *a = aligned_buf(n), *b = aligned_buf(n), *work = aligned_buf(ws);
     uint8_t *pad = malloc((size_t)w * (h + 2 * radius)), *line = malloc((size_t)w + 2 * radius);
@@ -445,7 +545,10 @@ static int test_image(int kind, int w, int h, int radius, int tile, uint32_t see
             }
         }
         memcpy(b, a, n);
-        if (kind) {
+        if (kind == 2) {
+            bad = qrf_sharpen_ref(a, w, h, radius, tile) != 0;
+            qrf_sharpen(b, w, h, radius, tile, work);
+        } else if (kind) {
             bad = qrf_local_mean_ref(a, w, h, radius, 15) != 0;
             qrf_local_mean(b, w, h, radius, 15, work);
         } else {
@@ -465,7 +568,7 @@ int qrf_selftest(void) {
     int r = test_ops(buf);
     free(buf);
     if (r) return r;
-    /* kind, w, h, radius, tile */
+    /* kind, w, h, radius, tile (kind 2: sharpen, tile = strength in %) */
     static const int cases[][5] = {
         {0, 16, 1, 2, 16}, {0, 16, 3, 2, 16}, {0, 32, 5, 2, 16}, {0, 48, 37, 2, 16},
         {0, 64, 64, 2, 16}, {0, 96, 50, 2, 16},
@@ -473,6 +576,8 @@ int qrf_selftest(void) {
         {0, 64, 40, 2, 8}, {0, 64, 40, 1, 16},
         {1, 16, 1, 3, 16}, {1, 32, 9, 3, 16}, {1, 48, 37, 5, 16}, {1, 64, 64, 24, 16},
         {1, 96, 70, 24, 16},
+        {2, 16, 1, 2, 300}, {2, 17, 3, 1, 100}, {2, 48, 37, 2, 300}, {2, 64, 64, 3, 200},
+        {2, 96, 50, 2, 300},
     };
     for (int i = 0; i < (int)(sizeof(cases) / sizeof(cases[0])); ++i) {
         const int *c = cases[i];

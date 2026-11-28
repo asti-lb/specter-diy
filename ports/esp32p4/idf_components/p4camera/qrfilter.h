@@ -1,5 +1,5 @@
 /*
- * Image filters for the second and third QR scan attempts.
+ * Image filters for the second, sharpened and full-resolution QR scan attempts.
  *
  * qrf_close_tiles(): grey-level closing (removes thin dark grid lines)
  * followed by a min/max tile threshold. One streaming pass over the rows:
@@ -10,7 +10,11 @@
  * t percent below the mean of the (2r+1) x (2r+1) window around it. Running
  * column and row sums, so the cost does not depend on r.
  *
- * Both give results bit-identical to the plain reference functions below,
+ * qrf_sharpen(): unsharp mask p + k% (p - blur), blur = (2r+1) box filter
+ * applied twice, with running sums; for the fourth attempt on the
+ * half-size plane, where a blurred code from a screen loses its edges.
+ *
+ * All give results bit-identical to the plain reference functions below,
  * which qrf_selftest() checks. Off the P4 (ESP_PLATFORM undefined) the PIE
  * instructions are emulated in C, so the same code can be checked on a PC.
  */
@@ -36,6 +40,12 @@ void qrf_close_tiles(uint8_t *img, int w, int h, int radius, int tile, uint8_t *
  * p * n * 100 < window_sum * (100 - t), n = pixels in the (clipped) window. */
 void qrf_local_mean(uint8_t *img, int w, int h, int r, int t, uint8_t *work);
 
+/* Unsharp mask in place: p + k * (p - blur) / 100, clamped to 0..255; blur is
+ * a (2r+1) x (2r+1) box filter (edges repeated) applied twice, r 1..3.
+ * work: qrf_sharpen_work_size(w, h) bytes, any alignment. */
+size_t qrf_sharpen_work_size(int w, int h);
+void qrf_sharpen(uint8_t *img, int w, int h, int r, int k, uint8_t *work);
+
 /* Reference implementations (plain C, slow on the P4).
  * pad: w * (h + 2*radius) bytes, line: w + 2*radius bytes,
  * tiles: 3 * ceil(w/tile) * ceil(h/tile) bytes. */
@@ -44,6 +54,8 @@ void qrf_tiles_ref(uint8_t *img, int w, int h, int tile, uint8_t *tiles);
 /* Integral image version; allocates 4 * (w+1) * (h+1) bytes. Returns -1
  * when out of memory. */
 int qrf_local_mean_ref(uint8_t *img, int w, int h, int r, int t);
+/* Allocates 2 * w * h bytes. Returns -1 when out of memory. */
+int qrf_sharpen_ref(uint8_t *img, int w, int h, int r, int k);
 
 /* Compares the streaming filters with the references on synthetic images.
  * Returns 0 when they agree; 101..104 when a single PIE instruction does not
