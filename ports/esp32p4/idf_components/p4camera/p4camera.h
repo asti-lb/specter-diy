@@ -98,5 +98,10 @@ void p4camera_preview_disable(void);
  * returns how many frames were copied so far; changes with every new frame.
  * Call it from the task that draws the buffer. */
 uint32_t p4camera_preview_frames(void);
+/** Milliseconds since the decoder last located a code - three finder
+ * patterns forming a grid - whether or not it could read it; UINT32_MAX
+ * if it never did. Lets the scan screen tell the user that the code is in
+ * view and only has to be held still a little longer. */
+uint32_t p4camera_seen_ago_ms(void);
 
 #endif  // P4CAMERA_H

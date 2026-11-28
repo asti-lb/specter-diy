@@ -536,6 +536,11 @@ void p4camera_gray_size(uint16_t *width, uint16_t *height) {
 #define FULL_ATTEMPT_EVERY 3
 static uint8_t full_attempt_turn;
 
+/* Time in ms (esp_timer, truncated) of the last frame in which the decoder
+ * located a code, 0 for never. 32 bits, so the decoder task on the other
+ * core writes it in one store. */
+static volatile uint32_t seen_at_ms;
+
 /* Every scan buffer may hold a picture of a seed, or a filtered copy of it.
  * Blank them all in one place, so a buffer added later cannot be missed by
  * one of the callers: flush, closing the scan screen, and freeing. */
@@ -856,9 +861,21 @@ static bool decode_one(const uint8_t *frame) {
     return_decoder_frame();
     if (full_attempt) {
         filter_full();
-        found = decode_plane(full_buffer, frame_width, frame_height, result, &seen);
+        found = decode_plane(full_buffer, frame_width, frame_height, result, &seen2);
+        seen = seen || seen2;
+    }
+    if (seen || found) {
+        seen_at_ms = (uint32_t)(esp_timer_get_time() / 1000) | 1;
     }
     return found;
+}
+
+uint32_t p4camera_seen_ago_ms(void) {
+    uint32_t at = seen_at_ms;
+    if (!at) {
+        return UINT32_MAX;
+    }
+    return (uint32_t)(esp_timer_get_time() / 1000) - at;
 }
 
 static void decode_task(void *arg) {

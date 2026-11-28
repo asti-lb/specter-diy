@@ -5,6 +5,16 @@ from .progress import Progress
 # the frame to this size.
 PREVIEW_SIZE = 440
 
+# Frame around the preview: red while nothing is found, green while the
+# decoder locates a code - three finder patterns - even if it cannot read
+# it yet. Tells the user to hold still instead of moving back and forth.
+FRAME_WIDTH = 6
+FRAME_SEARCHING = lv.color_hex(0xD0342C)
+FRAME_FOUND = lv.color_hex(0x00C853)
+# A code counts as found for this long after the last frame that located
+# it, so the frame does not flicker between frames.
+FOUND_HOLD_MS = 700
+
 
 class CameraScanProgress(Progress):
     """
@@ -27,6 +37,9 @@ class CameraScanProgress(Progress):
         buffer = camera.preview(PREVIEW_SIZE, PREVIEW_SIZE)
         display.image_rgb565(self.preview, buffer, PREVIEW_SIZE, PREVIEW_SIZE)
         self.preview.align_to(self.title, lv.ALIGN.OUT_BOTTOM_MID, 0, 20)
+        self.preview.set_style_outline_width(FRAME_WIDTH, 0)
+        self.preview.set_style_outline_color(FRAME_SEARCHING, 0)
+        self._found = False
 
         self.page.align_to(self.preview, lv.ALIGN.OUT_BOTTOM_MID, 0, 15)
         self.message.align(lv.ALIGN.TOP_MID, 0, 0)
@@ -42,6 +55,13 @@ class CameraScanProgress(Progress):
         if frames != self._frames:
             self._frames = frames
             self._display.image_changed(self.preview)
+        seen = self._camera.seen_ms()
+        found = seen is not None and seen < FOUND_HOLD_MS
+        if found != self._found:
+            self._found = found
+            self.preview.set_style_outline_color(
+                FRAME_FOUND if found else FRAME_SEARCHING, 0
+            )
 
     def _on_delete(self, event):
         self._camera.preview_off()

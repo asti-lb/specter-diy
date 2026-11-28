@@ -147,6 +147,16 @@ static mp_obj_t camera_preview_frames_fn(void) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(camera_preview_frames_obj, camera_preview_frames_fn);
 
+/* Milliseconds since a code was last located (read or not), None if never. */
+static mp_obj_t camera_seen_ms_fn(void) {
+    uint32_t ago = p4camera_seen_ago_ms();
+    if (ago == UINT32_MAX) {
+        return mp_const_none;
+    }
+    return mp_obj_new_int_from_uint(ago);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(camera_seen_ms_obj, camera_seen_ms_fn);
+
 static const mp_rom_map_elem_t camera_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_camera) },
     { MP_ROM_QSTR(MP_QSTR_init),     MP_ROM_PTR(&camera_init_obj) },
@@ -163,6 +173,7 @@ static const mp_rom_map_elem_t camera_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_preview),  MP_ROM_PTR(&camera_preview_obj) },
     { MP_ROM_QSTR(MP_QSTR_preview_off), MP_ROM_PTR(&camera_preview_off_obj) },
     { MP_ROM_QSTR(MP_QSTR_preview_frames), MP_ROM_PTR(&camera_preview_frames_obj) },
+    { MP_ROM_QSTR(MP_QSTR_seen_ms),  MP_ROM_PTR(&camera_seen_ms_obj) },
 };
 static MP_DEFINE_CONST_DICT(camera_module_globals, camera_module_globals_table);
 
